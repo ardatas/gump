@@ -9,6 +9,7 @@ import warnings
 import numcodecs
 import numpy as np
 import zarr
+from scipy.ndimage import uniform_filter
 
 from .cache import TileData
 
@@ -16,22 +17,17 @@ from .cache import TileData
 LOGGER = logging.getLogger(__name__)
 
 S2_SCALE = 10_000.0
-S2_BLUE_INDEX = 1
 S2_RED_INDEX = 3
 S2_NIR_INDEX = 7
 S2_SWIR1_INDEX = 10
 S2_SWIR2_INDEX = 11
 
-_CACHE_COMPRESSOR = numcodecs.Blosc(cname="zstd", clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
-_FEATURE_CACHE_VERSION = 3  # bump when feature computation changes
+# Bump when the layout of `feature_cube`/`feature_names` changes so on-disk
+# `*.features.zarr` caches that were built by an older version are discarded
+# instead of silently feeding a mismatched input_dim into downstream models.
+FEATURE_CACHE_VERSION = 2
 
-# AEF embeddings are stored quantized (uint8-range float32).
-# Formula from the AlphaEarth workshop notebook:
-#   float = sign(raw - 127) * ((|raw - 127| / 127.5) ^ 2)
-# Pixels where all 64 dims are zero have no coverage and become NaN.
-_AEF_OFFSET: float = 127.0
-_AEF_SCALE: float = 127.5
-_AEF_POWER: float = 2.0
+_CACHE_COMPRESSOR = numcodecs.Blosc(cname="zstd", clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
 
 
 @dataclass(frozen=True)
@@ -98,7 +94,6 @@ def build_monthly_sequence(
         )
 
     s2_scaled = tile.s2_data / S2_SCALE
-    s2_cloud_mask = _cloud_shadow_mask(s2_scaled)  # (n_obs, H, W) True = bad
     s2_index_map = _index_by_year_month(tile.s2_year, tile.s2_month)
     s1_asc_index_map = _index_by_year_month(tile.s1_ascending_year, tile.s1_ascending_month)
     s1_desc_index_map = _index_by_year_month(tile.s1_descending_year, tile.s1_descending_month)
@@ -127,7 +122,6 @@ def build_monthly_sequence(
                 np.isfinite(band_red)
                 & np.isfinite(band_nir)
                 & ((band_red + band_nir + band_swir1 + band_swir2) > 0)
-                & ~s2_cloud_mask[s2_obs_index]
             )
             sequence_mask[time_idx] |= valid_pixel
 
@@ -161,58 +155,6 @@ def _index_by_year_month(years: np.ndarray, months: np.ndarray) -> dict[tuple[in
     return mapping
 
 
-def _cloud_shadow_mask(s2_scaled: np.ndarray) -> np.ndarray:
-    """Detect cloud and shadow pixels in Sentinel-2 reflectance data.
-
-    Returns a boolean mask (n_obs, H, W) where True = cloud or shadow.
-    Thresholds are chosen to be conservative: prefer false negatives over
-    masking real vegetation signal.
-
-    Cloud: high blue, visible NIR and SWIR (all optically bright)
-    Shadow: very dark NIR and blue (sub-canopy or cloud shadow)
-    Saturated: any band >1.0 (sensor saturation artifact)
-    """
-    if s2_scaled.shape[0] == 0:
-        return np.zeros(s2_scaled.shape[:1] + s2_scaled.shape[2:], dtype=bool)
-
-    blue = s2_scaled[:, S2_BLUE_INDEX]   # B02
-    nir = s2_scaled[:, S2_NIR_INDEX]     # B08
-    swir1 = s2_scaled[:, S2_SWIR1_INDEX] # B11
-
-    cloud = (blue > 0.20) & (nir > 0.10) & (swir1 > 0.10)
-    shadow = (nir < 0.06) & (blue < 0.06)
-    saturated = (s2_scaled > 1.2).any(axis=1)
-
-    return cloud | shadow | saturated
-
-
-def _dequantize_aef(data: np.ndarray) -> np.ndarray:
-    """Convert quantized AEF embeddings to real float values.
-
-    The embeddings are stored as uint8-range float32 (0–255).  The correct
-    inverse transform (per the AlphaEarth workshop notebook) is:
-
-        out = sign(raw - OFFSET) * ((|raw - OFFSET| / SCALE) ^ POWER)
-
-    Pixels where all 64 embedding dimensions are zero have no AEF coverage
-    and are set to NaN so they don't corrupt per-pixel statistics.
-
-    Input shape: (T, 64, H, W)
-    """
-    out = data.astype(np.float32).copy()
-    # Zero-group masking: all-zero 64-dim vectors mean no data
-    zero_mask = np.all(out == 0, axis=1, keepdims=True)  # (T, 1, H, W)
-    out = np.where(zero_mask, np.nan, out)
-    # Dequantize
-    out -= _AEF_OFFSET
-    out /= _AEF_SCALE
-    neg = out < 0
-    np.abs(out, out=out)
-    np.power(out, _AEF_POWER, out=out)
-    out[neg] *= -1
-    return out
-
-
 def build_tile_features(
     tile: TileData,
     target_years: tuple[int, ...],
@@ -236,9 +178,6 @@ def build_tile_features(
 
     # --- S2 ---
     s2 = tile.s2_data / S2_SCALE
-    _cloud_mask = _cloud_shadow_mask(s2)  # (n_obs, H, W)
-    if _cloud_mask.any():
-        s2 = np.where(_cloud_mask[:, None, :, :], np.nan, s2)
     s2_yearly = _yearly_reduce(s2, tile.s2_year, target_years, reducer="median")
     s2_std = _safe_nanstd(s2, axis=0)
     s2_delta = s2_yearly[-1] - s2_yearly[0]
@@ -305,7 +244,7 @@ def build_tile_features(
     s1_desc_avail = (~np.all(np.isnan(tile.s1_descending_data), axis=0)).astype(np.float32)
 
     # --- AEF ---
-    aef_yearly = _align_yearly_observations(_dequantize_aef(tile.aef_data), tile.aef_year, target_years)
+    aef_yearly = _align_yearly_observations(tile.aef_data, tile.aef_year, target_years)
     aef_mean = _safe_nanmean(aef_yearly, axis=0)
     aef_delta = aef_yearly[-1] - aef_yearly[0]
     aef_yearly_flat = aef_yearly.reshape(-1, *tile.forest_mask.shape)
@@ -318,6 +257,19 @@ def build_tile_features(
         ndvi_yearly=ndvi_yearly[:, 0],
         nbr_yearly=nbr_yearly[:, 0],
         ndmi_yearly=ndmi_yearly[:, 0],
+    )
+
+    # Spatial neighborhood features: cheap 3x3/5x5 stats that give the per-pixel
+    # model implicit local context (deforestation is patch-shaped, not point-shaped).
+    spatial_features, spatial_feature_names = _build_neighborhood_features(
+        forest_mask=tile.forest_mask,
+        persistence_score=persistence.persistence_score,
+        ndvi_drop=persistence.feature_layers[3],
+        nbr_drop=persistence.feature_layers[4],
+        ndmi_drop=persistence.feature_layers[5],
+        recent_ndvi=persistence.feature_layers[0],
+        s1_asc_delta=s1_delta[0],
+        s1_desc_delta=s1_delta[1],
     )
 
     feature_arrays = [
@@ -340,6 +292,7 @@ def build_tile_features(
         aef_delta,
         aef_yearly_flat,
         persistence.feature_layers,
+        spatial_features,
     ]
     feature_cube = np.concatenate(feature_arrays, axis=0).astype(np.float32)
     feature_cube = np.nan_to_num(feature_cube, nan=0.0, posinf=0.0, neginf=0.0)
@@ -384,6 +337,7 @@ def build_tile_features(
             "persistence_score",
             "persistence_mask",
         )
+        + spatial_feature_names
     )
 
     if use_cache:
@@ -423,7 +377,14 @@ def _load_feature_cache(
         z = zarr.open_group(str(path), mode="r")
         if list(z.attrs.get("target_years", [])) != list(target_years):
             return None
-        if int(z.attrs.get("cache_version", 1)) != _FEATURE_CACHE_VERSION:
+        cached_version = int(z.attrs.get("feature_version", 1))
+        if cached_version != FEATURE_CACHE_VERSION:
+            LOGGER.info(
+                "Discarding feature cache %s: version=%d, expected=%d",
+                path.name,
+                cached_version,
+                FEATURE_CACHE_VERSION,
+            )
             return None
         feature_cube = z["cube"][:].astype(np.float32)
         feature_names = tuple(z.attrs["feature_names"])
@@ -468,10 +429,147 @@ def _save_feature_cache(
             overwrite=True,
         )
         z.attrs["target_years"] = list(target_years)
-        z.attrs["cache_version"] = _FEATURE_CACHE_VERSION
         z.attrs["feature_names"] = list(feature_names)
+        z.attrs["feature_version"] = FEATURE_CACHE_VERSION
     except Exception as exc:
         LOGGER.warning("Feature cache save failed for %s: %s", tile_path.name, exc)
+
+
+def _build_neighborhood_features(
+    *,
+    forest_mask: np.ndarray,
+    persistence_score: np.ndarray,
+    ndvi_drop: np.ndarray,
+    nbr_drop: np.ndarray,
+    ndmi_drop: np.ndarray,
+    recent_ndvi: np.ndarray,
+    s1_asc_delta: np.ndarray,
+    s1_desc_delta: np.ndarray,
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Stack cheap 3x3 / 5x5 neighborhood statistics around each pixel.
+
+    These features let a strictly per-pixel classifier implicitly reason about
+    local spatial context (clearing edges, neighborhood canopy density, coherent
+    drops around a target pixel) without changing the model architecture.
+    """
+    forest_mask_f = forest_mask.astype(np.float32)
+    layers = [
+        ("persistence_score_mean_3x3", _neighborhood_mean(persistence_score, radius=1)),
+        ("persistence_score_std_3x3", _neighborhood_std(persistence_score, radius=1)),
+        ("persistence_score_mean_5x5", _neighborhood_mean(persistence_score, radius=2)),
+        ("ndvi_drop_mean_3x3", _neighborhood_mean(ndvi_drop, radius=1)),
+        ("ndvi_drop_std_3x3", _neighborhood_std(ndvi_drop, radius=1)),
+        ("nbr_drop_mean_3x3", _neighborhood_mean(nbr_drop, radius=1)),
+        ("ndmi_drop_mean_3x3", _neighborhood_mean(ndmi_drop, radius=1)),
+        ("recent_ndvi_mean_3x3", _neighborhood_mean(recent_ndvi, radius=1)),
+        ("s1_asc_delta_mean_3x3", _neighborhood_mean(s1_asc_delta, radius=1)),
+        ("s1_desc_delta_mean_3x3", _neighborhood_mean(s1_desc_delta, radius=1)),
+        ("canopy_density_5x5", _neighborhood_mean(forest_mask_f, radius=2)),
+    ]
+    stacked = np.stack([layer for _, layer in layers], axis=0).astype(np.float32)
+    names = tuple(name for name, _ in layers)
+    return stacked, names
+
+
+def _neighborhood_mean(image: np.ndarray, radius: int) -> np.ndarray:
+    size = 2 * radius + 1
+    return uniform_filter(
+        image.astype(np.float32), size=size, mode="nearest"
+    ).astype(np.float32)
+
+
+def _neighborhood_std(image: np.ndarray, radius: int) -> np.ndarray:
+    size = 2 * radius + 1
+    arr = image.astype(np.float32)
+    mean = uniform_filter(arr, size=size, mode="nearest")
+    sq_mean = uniform_filter(arr * arr, size=size, mode="nearest")
+    variance = np.maximum(sq_mean - mean * mean, 0.0)
+    return np.sqrt(variance, dtype=np.float32)
+
+
+LABEL_STRATEGIES = ("persistence_refined", "consensus", "any_source")
+
+
+def apply_label_strategy(
+    tile: TileData,
+    tile_features: "TileFeatures",
+    strategy: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (training_labels, training_weights) for the chosen label strategy.
+
+    Strategies
+    ----------
+    persistence_refined
+        Legacy default baked into ``compute_persistence_targets``. Keeps only
+        pixels where the labels AND the persistence heuristic agree, and
+        strongly down-weights ambiguous alerts. Highest precision on the held
+        out validation region, but systematically drops RADD-only events and
+        anything that does not produce a visible NDVI drop -- so the obvious
+        over-fit to our own heuristic.
+    consensus
+        ``votes >= 2`` pixels inside the forest mask, weights from
+        ``tile.label_weight`` (which already encodes vote-count confidence).
+        No persistence gating.
+    any_source
+        ``votes >= 1`` pixels inside the forest mask. All three label sources
+        are treated as independent positive signals; weights are still derived
+        from ``tile.label_weight`` (single-source weight 0.3, double 0.8,
+        triple 1.0) so noisy single-source alerts are down-weighted but not
+        discarded. Highest recall training signal, closest to what the live
+        leaderboard is likely scoring against.
+    """
+    if strategy not in LABEL_STRATEGIES:
+        raise ValueError(
+            f"Unknown label strategy {strategy!r}; expected one of {LABEL_STRATEGIES}."
+        )
+    if (
+        tile.label_consensus is None
+        or tile.label_weight is None
+        or tile.label_votes is None
+    ):
+        raise ValueError(
+            f"Tile {tile.metadata.tile_id} has no training labels; cannot apply a label strategy."
+        )
+
+    forest_mask = tile_features.forest_mask
+    votes = tile.label_votes.astype(np.uint8)
+    raw_weights = tile.label_weight.astype(np.float32).copy()
+    persistence_score = tile_features.persistence_score
+
+    if strategy == "persistence_refined":
+        strong_consensus = votes >= 2
+        triple_consensus = votes == 3
+        single_source = votes == 1
+        refined_positive = (
+            (strong_consensus & (persistence_score >= 0.30))
+            | (triple_consensus & (persistence_score >= 0.15))
+            | (single_source & (persistence_score >= 0.75))
+        ) & forest_mask
+        weights = raw_weights
+        weights[~forest_mask] = 0.0
+        ambiguous_alert = (tile.label_consensus.astype(bool)) & ~refined_positive
+        weights[ambiguous_alert] *= 0.15
+        likely_unlabeled_positive = (
+            (votes == 0) & forest_mask & (persistence_score >= 0.75)
+        )
+        weights[likely_unlabeled_positive] = 0.0
+        medium_single_source = (
+            single_source
+            & (persistence_score >= 0.45)
+            & (persistence_score < 0.75)
+        )
+        weights[medium_single_source] *= 0.25
+        return refined_positive.astype(np.uint8), weights
+
+    if strategy == "consensus":
+        labels = ((votes >= 2) & forest_mask).astype(np.uint8)
+        raw_weights[~forest_mask] = 0.0
+        return labels, raw_weights
+
+    # any_source: any label source fires -> positive.
+    labels = ((votes >= 1) & forest_mask).astype(np.uint8)
+    raw_weights[~forest_mask] = 0.0
+    return labels, raw_weights
 
 
 def compute_feature_norm_stats(
@@ -799,7 +897,6 @@ def _scaled_score(values: np.ndarray, *, low: float, high: float) -> np.ndarray:
     if high <= low:
         raise ValueError("high must be greater than low")
     return np.clip((values - low) / (high - low), 0.0, 1.0).astype(np.float32)
-
 
 
 def compute_year_heuristic_map(tile: "TileData", target_years: tuple[int, ...]) -> np.ndarray:

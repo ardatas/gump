@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import hashlib
 from itertools import repeat
@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .cache import TileMetadata, choose_validation_regions, discover_target_years, list_tile_paths, load_tile_data, load_tile_metadata
+from .cache import TileData, TileMetadata, choose_validation_regions, discover_target_years, list_tile_paths, load_tile_data, load_tile_metadata
 from .dataset import (
     PixelSampleDataset,
     build_eval_matrix,
@@ -25,7 +25,10 @@ from .dataset import (
     sample_tile_training_data,
 )
 from .feature_bank import (
+    LABEL_STRATEGIES,
     SEQUENCE_CHANNELS,
+    TileFeatures,
+    apply_label_strategy,
     build_monthly_sequence,
     build_target_months,
     build_tile_features,
@@ -148,6 +151,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stopping-patience", type=int, default=0)
     parser.add_argument("--use-temporal", action="store_true", help="Build monthly sequences (auto when --model-name=tcnn).")
     parser.add_argument("--aux-year-loss-weight", type=float, default=0.0, help="Multi-task weight for year classification head.")
+    parser.add_argument(
+        "--label-strategy",
+        choices=LABEL_STRATEGIES,
+        default="any_source",
+        help=(
+            "How to derive training_labels/weights from the cached tile labels. "
+            "any_source (default) treats any label source (RADD/GLAD-L/GLAD-S2) "
+            "firing as positive, matching the leaderboard's broad GT better than "
+            "the persistence-refined gate that was optimising for our own heuristic."
+        ),
+    )
     parser.add_argument("--resume", type=Path)
     return parser.parse_args()
 
@@ -205,6 +219,9 @@ def main() -> None:
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
 
+    label_strategy = str(args.label_strategy)
+    LOGGER.info("Label strategy: %s", label_strategy)
+
     train_prep_start = perf_counter()
     train_data = prepare_train_data(
         metadata=train_metadata,
@@ -214,6 +231,7 @@ def main() -> None:
         max_samples_per_tile=args.max_samples_per_tile,
         seed=args.seed,
         prep_workers=args.prep_workers,
+        label_strategy=label_strategy,
     )
     LOGGER.info(
         "Prepared %s training rows in %.1fs",
@@ -227,6 +245,7 @@ def main() -> None:
         target_years=target_years,
         temporal_config=temporal_config,
         prep_workers=args.prep_workers,
+        label_strategy=label_strategy,
     )
     LOGGER.info(
         "Prepared %s validation rows in %.1fs",
@@ -508,6 +527,28 @@ def _stable_tile_seed(seed: int, tile_id: str) -> int:
     return int.from_bytes(digest, byteorder="little", signed=False)
 
 
+def _tile_features_with_strategy(
+    tile: TileData,
+    target_years: tuple[int, ...],
+    label_strategy: str,
+) -> TileFeatures:
+    """Build tile features and override labels/weights according to ``label_strategy``.
+
+    ``build_tile_features`` can either compute ``persistence.training_labels``
+    (cache miss) or fall back to ``tile.label_consensus`` (cache hit); both are
+    inconsistent with each other and with what we actually want to train on.
+    This helper re-derives labels/weights directly from ``tile.label_votes`` and
+    the tile's persistence score so the training signal no longer depends on
+    which code path happened to populate the cache.
+    """
+    tile_features = build_tile_features(tile, target_years)
+    if tile.label_votes is None:
+        # Test-split tile or unlabelled cache; nothing to override.
+        return tile_features
+    labels, weights = apply_label_strategy(tile, tile_features, label_strategy)
+    return replace(tile_features, labels=labels, weights=weights)
+
+
 def _resolve_prep_workers(prep_workers: int, item_count: int) -> int:
     if item_count <= 1:
         return 1
@@ -521,9 +562,10 @@ def _prepare_train_tile(
     negative_ratio: float,
     max_samples_per_tile: int | None,
     seed: int,
+    label_strategy: str,
 ) -> PreparedTrainTile:
     tile = load_tile_data(item.path)
-    tile_features = build_tile_features(tile, target_years)
+    tile_features = _tile_features_with_strategy(tile, target_years, label_strategy)
     sequence = build_monthly_sequence(tile, temporal_config.target_months) if temporal_config.enabled else None
     rng = np.random.default_rng(_stable_tile_seed(seed, item.tile_id))
     try:
@@ -572,9 +614,15 @@ def prepare_train_data(
     max_samples_per_tile: int | None,
     seed: int,
     prep_workers: int,
+    label_strategy: str = "persistence_refined",
 ) -> PreparedTrainData:
     worker_count = _resolve_prep_workers(prep_workers, len(metadata))
-    LOGGER.info("Preparing %s train tiles with %s worker(s)", len(metadata), worker_count)
+    LOGGER.info(
+        "Preparing %s train tiles with %s worker(s) [label_strategy=%s]",
+        len(metadata),
+        worker_count,
+        label_strategy,
+    )
 
     results: list[PreparedTrainTile]
     if worker_count == 1:
@@ -586,6 +634,7 @@ def prepare_train_data(
                 negative_ratio,
                 max_samples_per_tile,
                 seed,
+                label_strategy,
             )
             for item in metadata
         ]
@@ -600,6 +649,7 @@ def prepare_train_data(
                     repeat(negative_ratio),
                     repeat(max_samples_per_tile),
                     repeat(seed),
+                    repeat(label_strategy),
                 )
             )
 
@@ -657,9 +707,10 @@ def _prepare_eval_tile(
     item: TileMetadata,
     target_years: tuple[int, ...],
     temporal_config: TemporalConfig,
+    label_strategy: str,
 ) -> PreparedEvalTile:
     tile = load_tile_data(item.path)
-    tile_features = build_tile_features(tile, target_years)
+    tile_features = _tile_features_with_strategy(tile, target_years, label_strategy)
     try:
         feature_matrix, tile_labels, tile_weights, _ = build_eval_matrix(tile_features)
     except ValueError as exc:
@@ -691,13 +742,22 @@ def prepare_eval_data(
     target_years: tuple[int, ...],
     temporal_config: TemporalConfig,
     prep_workers: int,
+    label_strategy: str = "persistence_refined",
 ) -> PreparedEvalData:
     worker_count = _resolve_prep_workers(prep_workers, len(metadata))
-    LOGGER.info("Preparing %s validation tiles with %s worker(s)", len(metadata), worker_count)
+    LOGGER.info(
+        "Preparing %s validation tiles with %s worker(s) [label_strategy=%s]",
+        len(metadata),
+        worker_count,
+        label_strategy,
+    )
 
     results: list[PreparedEvalTile]
     if worker_count == 1:
-        results = [_prepare_eval_tile(item, target_years, temporal_config) for item in metadata]
+        results = [
+            _prepare_eval_tile(item, target_years, temporal_config, label_strategy)
+            for item in metadata
+        ]
     else:
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             results = list(
@@ -706,6 +766,7 @@ def prepare_eval_data(
                     metadata,
                     repeat(target_years),
                     repeat(temporal_config),
+                    repeat(label_strategy),
                 )
             )
 

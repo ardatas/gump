@@ -14,3 +14,7 @@ submission/
 *.npz
 .artifacts
 submissions/
+www/.next/
+www/node_modules/
+_dl_anysrc/
+exports/

@@ -79,9 +79,9 @@ def main() -> None:
         raise SystemExit("No evaluation tiles found for the requested split/regions.")
 
     thresholds = args.thresholds or [float(checkpoint["threshold"])]
-    closing_radii = args.closing_radii or [1]
-    opening_radii = args.opening_radii or [1]
-    min_area_has = args.min_area_has or [0.5]
+    closing_radii = args.closing_radii or [0, 1]
+    opening_radii = args.opening_radii or [0]
+    min_area_has = args.min_area_has or [0.1, 0.3]
     min_hole_area_has = args.min_hole_area_has or [0.0]
     persistence_thresholds = args.persistence_thresholds or [0.0]
 
