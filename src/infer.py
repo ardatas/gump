@@ -144,7 +144,30 @@ def main() -> None:
 
         ensemble_probabilities = np.zeros(feature_matrix.shape[0], dtype=np.float32)
         for bundle in bundles:
-            normalized = normalize_features(feature_matrix, bundle.normalizer)
+            # Sub-select only the features this model expects, in the correct order
+            bundle_feature_matrix = feature_matrix
+            if bundle.feature_names and hasattr(tile_features, "feature_names") and tile_features.feature_names:
+                feature_indices = []
+                missing_features = []
+                for expected_name in bundle.feature_names:
+                    try:
+                        idx = tile_features.feature_names.index(expected_name)
+                        feature_indices.append(idx)
+                    except ValueError:
+                        missing_features.append(expected_name)
+                
+                if missing_features:
+                    LOGGER.error("Model expects features not present in tile: %s", missing_features[:5])
+                    continue
+                bundle_feature_matrix = feature_matrix[:, feature_indices]
+            elif feature_matrix.shape[1] != bundle.normalizer.mean.shape[0]:
+                LOGGER.error(
+                    "Model normalizer expects %d features, but generated matrix has %d and no feature_names mapping was found.", 
+                    bundle.normalizer.mean.shape[0], feature_matrix.shape[1]
+                )
+                continue
+
+            normalized = normalize_features(bundle_feature_matrix, bundle.normalizer)
             bundle_sequence = sequence_matrix if bundle.sequence_channels > 0 else None
             tile_probabilities = predict_probabilities(
                 model=bundle.model,
