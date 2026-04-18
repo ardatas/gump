@@ -18,3 +18,4 @@ www/.next/
 www/node_modules/
 _dl_anysrc/
 exports/
+submission_*.geojson
