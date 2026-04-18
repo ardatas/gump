@@ -186,7 +186,34 @@ def main() -> None:
                 persistence_threshold=0.0,
             )
 
+            # Extract the specific feature names this model expects
+            expected_feature_names = tuple(str(name) for name in payload.get("feature_names", ()))
+
             feature_matrix, prediction_mask = build_prediction_matrix(tile_features)
+            
+            # Sub-select only the features this model expects, in the correct order
+            if expected_feature_names and hasattr(tile_features, "feature_names") and tile_features.feature_names:
+                # Find indices of expected features in the generated feature cube
+                feature_indices = []
+                missing_features = []
+                for expected_name in expected_feature_names:
+                    try:
+                        idx = tile_features.feature_names.index(expected_name)
+                        feature_indices.append(idx)
+                    except ValueError:
+                        missing_features.append(expected_name)
+                
+                if missing_features:
+                    LOGGER.error("Model %s expects features not present in tile: %s", model_name, missing_features[:5])
+                    continue
+                
+                feature_matrix = feature_matrix[:, feature_indices]
+            elif feature_matrix.shape[1] != normalizer.mean.shape[0]:
+                LOGGER.error(
+                    "Model %s normalizer expects %d features, but generated matrix has %d and no feature_names mapping was found.", 
+                    model_name, normalizer.mean.shape[0], feature_matrix.shape[1]
+                )
+                continue
             
             sequence_matrix = None
             if sequence_channels > 0 and feature_matrix.shape[0] > 0:
