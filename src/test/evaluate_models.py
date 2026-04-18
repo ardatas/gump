@@ -97,45 +97,68 @@ def main() -> None:
     if not tile_paths:
         raise SystemExit(f"No evaluation tiles found for split '{args.split}' in {actual_cache_root}.")
 
-    results = []
-
-    LOGGER.info("Starting evaluation for %d models on %d test tiles.", len(checkpoints), len(tile_paths))
-
-    for ckpt_path in tqdm(checkpoints, desc="Evaluating Models", position=0):
+    # Load all models into memory first
+    models = []
+    model_names = []
+    payloads = []
+    
+    LOGGER.info("Loading %d checkpoints into memory...", len(checkpoints))
+    for ckpt_path in checkpoints:
         model_name = ckpt_path.parent.name
-        # LOGGER.info("Evaluating model: %s", model_name) # Using tqdm desc instead
-        
         payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         model = load_model_from_checkpoint(payload).to(device)
         model.eval()
-
-        normalizer = load_normalizer(payload)
-        target_years = tuple(int(year) for year in payload["target_years"])
-        raw_months = payload.get("target_months") or []
-        target_months = tuple((int(year), int(month)) for year, month in raw_months)
-        sequence_channels = int(payload.get("sequence_channels", 0) or 0)
         
-        default_threshold = float(payload.get("best_threshold", payload.get("threshold", 0.5)))
-        threshold = args.threshold_override if args.threshold_override is not None else default_threshold
+        models.append(model)
+        model_names.append(model_name)
+        payloads.append(payload)
+
+    # Prepare dictionaries to accumulate results per model
+    all_labels = {name: [] for name in model_names}
+    all_predictions = {name: [] for name in model_names}
+    all_weights = {name: [] for name in model_names}
+
+    LOGGER.info("Evaluating models on %d test tiles...", len(tile_paths))
+
+    for tile_path in tqdm(tile_paths, desc="Processing Tiles", position=0):
+        tile = load_tile_data(tile_path)
         
-        postprocess_config = PostprocessConfig(
-            threshold=threshold,
-            closing_radius=max(0, args.closing_radius),
-            opening_radius=max(0, args.opening_radius),
-            min_area_ha=max(0.0, args.min_area_ha),
-            min_hole_area_ha=0.0,
-            persistence_threshold=0.0,
-        )
-
-        labels_list: list[np.ndarray] = []
-        predictions_list: list[np.ndarray] = []
-        weights_list: list[np.ndarray] = []
-
-        for tile_path in tqdm(tile_paths, desc=f"Tiles ({model_name})", leave=False, position=1):
-            tile = load_tile_data(tile_path)
-            tile_features = build_tile_features(tile, target_years)
+        # We need to build features for the superset of target_years needed by any model.
+        # For simplicity, if all models use the same years, we build it once.
+        # Otherwise, we track built features by their target_years tuple.
+        built_features_cache = {}
+        
+        for i, model in enumerate(models):
+            model_name = model_names[i]
+            payload = payloads[i]
+            
+            target_years = tuple(int(year) for year in payload["target_years"])
+            
+            # Build or get features for these specific target years
+            if target_years not in built_features_cache:
+                built_features_cache[target_years] = build_tile_features(tile, target_years)
+            
+            tile_features = built_features_cache[target_years]
+            
             if tile_features.labels is None or tile_features.weights is None:
                 continue
+
+            normalizer = load_normalizer(payload)
+            raw_months = payload.get("target_months") or []
+            target_months = tuple((int(year), int(month)) for year, month in raw_months)
+            sequence_channels = int(payload.get("sequence_channels", 0) or 0)
+            
+            default_threshold = float(payload.get("best_threshold", payload.get("threshold", 0.5)))
+            threshold = args.threshold_override if args.threshold_override is not None else default_threshold
+            
+            postprocess_config = PostprocessConfig(
+                threshold=threshold,
+                closing_radius=max(0, args.closing_radius),
+                opening_radius=max(0, args.opening_radius),
+                min_area_ha=max(0.0, args.min_area_ha),
+                min_hole_area_ha=0.0,
+                persistence_threshold=0.0,
+            )
 
             feature_matrix, prediction_mask = build_prediction_matrix(tile_features)
             
@@ -163,30 +186,37 @@ def main() -> None:
             )
 
             eval_mask = tile_features.forest_mask & (tile_features.weights > 0)
-            labels_list.append(tile_features.labels[eval_mask].astype(np.float32))
-            predictions_list.append(prediction_map[eval_mask].astype(np.float32))
-            weights_list.append(tile_features.weights[eval_mask].astype(np.float32))
-
-        if not labels_list:
+            all_labels[model_name].append(tile_features.labels[eval_mask].astype(np.float32))
+            all_predictions[model_name].append(prediction_map[eval_mask].astype(np.float32))
+            all_weights[model_name].append(tile_features.weights[eval_mask].astype(np.float32))
+            
+    results = []
+    
+    for i, model_name in enumerate(model_names):
+        payload = payloads[i]
+        threshold = args.threshold_override if args.threshold_override is not None else float(payload.get("best_threshold", payload.get("threshold", 0.5)))
+        
+        if not all_labels[model_name]:
             LOGGER.warning("No valid evaluation pixels found for %s", model_name)
             continue
+            
+        labels_cat = np.concatenate(all_labels[model_name], axis=0)
+        predictions_cat = np.concatenate(all_predictions[model_name], axis=0)
+        weights_cat = np.concatenate(all_weights[model_name], axis=0)
 
-        all_labels = np.concatenate(labels_list, axis=0)
-        all_predictions = np.concatenate(predictions_list, axis=0)
-        all_weights = np.concatenate(weights_list, axis=0)
-
-        metrics = weighted_precision_recall_f1(all_labels, all_predictions, all_weights)
+        metrics = weighted_precision_recall_f1(labels_cat, predictions_cat, weights_cat)
 
         results.append({
             "model_name": model_name,
-            "checkpoint": str(ckpt_path),
+            "checkpoint": str(checkpoints[i]),
             "threshold_used": float(threshold),
             "metrics": metrics,
         })
         
-        tqdm.write(
-            f"Model {model_name}: u-IoU={metrics['unweighted_iou']:.4f} (w-IoU={metrics['iou']:.4f}), F1={metrics['f1']:.4f}"
-        )
+    tqdm.write("\nEvaluation Summary:")
+    for r in results:
+        m = r["metrics"]
+        tqdm.write(f"Model {r['model_name']}: u-IoU={m['unweighted_iou']:.4f} (w-IoU={m['iou']:.4f}), F1={m['f1']:.4f}")
 
     if not results:
         LOGGER.warning("No valid results computed.")
