@@ -58,6 +58,7 @@ class TileSummary(BaseModel):
     paths: dict[str, str] = Field(default_factory=dict)
     metrics: TileSummaryMetrics = Field(default_factory=TileSummaryMetrics)
     bounds: TileBounds | None = None
+    months_s2: list[tuple[int, int]] | None = None  # [[year, month], ...]
 
 class TileListResponse(BaseModel):
     run_id: str

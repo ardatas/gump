@@ -58,6 +58,7 @@ interface TileSummary {
   artifacts: { geojson: boolean; overlay_png: boolean; prob_tif: boolean }
   paths: { geojson?: string; overlay_png?: string; prob_tif?: string }
   bounds: TileBounds | null
+  months_s2: [number, number][] | null
 }
 
 type ColorMode = 'year' | 'confidence'
@@ -156,6 +157,7 @@ export default function GumpApp() {
   const [availableTiles, setAvailableTiles] = useState<TileSummary[]>([])
   const [activeTileIdx, setActiveTileIdx] = useState<number | null>(null)
   const [composite, setComposite] = useState<Composite>('rgb')
+  const [selectedMonth, setSelectedMonth] = useState<number | null>(null) // null = auto
   const [satelliteLoading, setSatelliteLoading] = useState(false)
 
   const showToast = useCallback((msg: string) => {
@@ -284,6 +286,9 @@ export default function GumpApp() {
       })
   }, [activeRunId])
 
+  // Reset month selection when tile changes
+  useEffect(() => { setSelectedMonth(null) }, [activeTileIdx])
+
   // Satellite preview overlay
   useEffect(() => {
     if (activeTileIdx === null || !leafletMap.current) return
@@ -292,7 +297,8 @@ export default function GumpApp() {
 
     const { min_lat, min_lon, max_lat, max_lon } = tile.bounds
     const bounds: [[number, number], [number, number]] = [[min_lat, min_lon], [max_lat, max_lon]]
-    const url = `http://${window.location.hostname}:8000/api/tiles/${tile.tile_id}/preview.png?composite=${composite}&month=auto`
+    const monthParam = selectedMonth !== null ? selectedMonth : 'auto'
+    const url = `http://${window.location.hostname}:8000/api/tiles/${tile.tile_id}/preview.png?composite=${composite}&month=${monthParam}`
 
     setSatelliteLoading(true)
     import('leaflet').then(({ default: L }) => {
@@ -305,7 +311,7 @@ export default function GumpApp() {
       satelliteOverlayRef.current = overlay
     })
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTileIdx, composite])
+  }, [activeTileIdx, composite, selectedMonth])
 
   // basemap switch
   useEffect(() => {
@@ -559,6 +565,36 @@ export default function GumpApp() {
                 </li>
               ))}
             </ul>
+            {(() => {
+              const tile = availableTiles[activeTileIdx ?? 0]
+              const months = tile?.months_s2
+              if (!months?.length) return null
+              const idx = selectedMonth ?? months.length - 1
+              const [yr, mo] = months[Math.min(idx, months.length - 1)]
+              const label = `${['Jan','Feb','Mär','Apr','Mai','Jun','Jul','Aug','Sep','Okt','Nov','Dez'][mo-1]} ${yr}`
+              return (
+                <div style={{ marginTop: 10 }}>
+                  <div className="filter-label-row">
+                    <label>Zeitpunkt</label>
+                    <strong style={{ fontFamily: 'monospace', fontSize: 12 }}>{selectedMonth !== null ? label : `Auto · ${label}`}</strong>
+                  </div>
+                  <input type="range" min={0} max={months.length - 1} step={1}
+                    value={selectedMonth ?? months.length - 1}
+                    onChange={e => setSelectedMonth(+e.target.value)}
+                    style={{ width: '100%', marginTop: 4 }}
+                  />
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text-dim,#94a3b8)', marginTop: 2 }}>
+                    <span>{months[0][0]}</span>
+                    {[...new Set(months.map(m => m[0]))].slice(1).map(y => <span key={y}>{y}</span>)}
+                  </div>
+                  {selectedMonth !== null && (
+                    <button className="btn-link" style={{ marginTop: 4, fontSize: 11 }}
+                      onClick={() => setSelectedMonth(null)}>↺ Auto (bestes Bild)</button>
+                  )}
+                </div>
+              )
+            })()}
+
             <div style={{ marginTop: 10 }}>
               <div className="filter-label-row">
                 <label>Spektrum</label>

@@ -8,35 +8,40 @@ from src.api.schemas import TileSummary, TileArtifacts, TileSummaryMetrics, Tile
 LOGGER = logging.getLogger(__name__)
 
 
+def _load_meta(tile_id: str) -> dict | None:
+    for base in [CACHE_DIR, CACHE_DIR / "gump"]:
+        p = base / tile_id / "meta.json"
+        if p.exists():
+            with open(p) as f:
+                return json.load(f)
+    return None
+
+
 def _compute_bounds(tile_id: str) -> TileBounds | None:
-    meta_path = CACHE_DIR / tile_id / "meta.json"
-    if not meta_path.exists():
-        meta_path = CACHE_DIR / "gump" / tile_id / "meta.json"
-    if not meta_path.exists():
+    meta = _load_meta(tile_id)
+    if meta is None:
         return None
     try:
-        with open(meta_path) as f:
-            meta = json.load(f)
         crs = meta["crs"]
-        tr = meta["transform"]   # [px, 0, origin_x, 0, py, origin_y]
+        tr = meta["transform"]
         w, h = meta["width"], meta["height"]
-        ox, oy = tr[2], tr[5]
-        px, py = tr[0], tr[4]
-        # corners in projected CRS
+        ox, oy, px, py = tr[2], tr[5], tr[0], tr[4]
         xs = [ox, ox + px * w]
         ys = [oy, oy + py * h]
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
         from pyproj import Transformer
         t = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
-        lons, lats = t.transform([min_x, max_x], [min_y, max_y])
-        return TileBounds(
-            min_lon=min(lons), min_lat=min(lats),
-            max_lon=max(lons), max_lat=max(lats),
-        )
+        lons, lats = t.transform([min(xs), max(xs)], [min(ys), max(ys)])
+        return TileBounds(min_lon=min(lons), min_lat=min(lats), max_lon=max(lons), max_lat=max(lats))
     except Exception as e:
         LOGGER.warning("Could not compute bounds for %s: %s", tile_id, e)
         return None
+
+
+def _get_months(tile_id: str) -> list[tuple[int, int]] | None:
+    meta = _load_meta(tile_id)
+    if meta is None:
+        return None
+    return [tuple(m) for m in meta.get("months_s2", [])] or None
 
 def get_tile_summary(run_id: str, tile_id: str) -> TileSummary | None:
     tile_dir = ARTIFACTS_DIR / run_id / tile_id
@@ -58,6 +63,7 @@ def get_tile_summary(run_id: str, tile_id: str) -> TileSummary | None:
                 paths=data.get("paths", {}),
                 metrics=TileSummaryMetrics(**data.get("metrics", {})),
                 bounds=_compute_bounds(tile_id),
+                months_s2=_get_months(tile_id),
             )
         except Exception as e:
             LOGGER.warning("Failed to parse summary.json in %s: %s", tile_dir, e)
@@ -83,6 +89,7 @@ def get_tile_summary(run_id: str, tile_id: str) -> TileSummary | None:
         ),
         paths=paths,
         bounds=_compute_bounds(tile_id),
+        months_s2=_get_months(tile_id),
     )
 
 def get_all_tiles_for_run(run_id: str) -> list[TileSummary]:
