@@ -22,6 +22,15 @@ S2_SWIR1_INDEX = 10
 S2_SWIR2_INDEX = 11
 
 _CACHE_COMPRESSOR = numcodecs.Blosc(cname="zstd", clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
+_FEATURE_CACHE_VERSION = 2  # bump when feature computation changes
+
+# AEF embeddings are stored quantized (uint8-range float32).
+# Formula from the AlphaEarth workshop notebook:
+#   float = sign(raw - 127) * ((|raw - 127| / 127.5) ^ 2)
+# Pixels where all 64 dims are zero have no coverage and become NaN.
+_AEF_OFFSET: float = 127.0
+_AEF_SCALE: float = 127.5
+_AEF_POWER: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -149,6 +158,33 @@ def _index_by_year_month(years: np.ndarray, months: np.ndarray) -> dict[tuple[in
     return mapping
 
 
+def _dequantize_aef(data: np.ndarray) -> np.ndarray:
+    """Convert quantized AEF embeddings to real float values.
+
+    The embeddings are stored as uint8-range float32 (0–255).  The correct
+    inverse transform (per the AlphaEarth workshop notebook) is:
+
+        out = sign(raw - OFFSET) * ((|raw - OFFSET| / SCALE) ^ POWER)
+
+    Pixels where all 64 embedding dimensions are zero have no AEF coverage
+    and are set to NaN so they don't corrupt per-pixel statistics.
+
+    Input shape: (T, 64, H, W)
+    """
+    out = data.astype(np.float32).copy()
+    # Zero-group masking: all-zero 64-dim vectors mean no data
+    zero_mask = np.all(out == 0, axis=1, keepdims=True)  # (T, 1, H, W)
+    out = np.where(zero_mask, np.nan, out)
+    # Dequantize
+    out -= _AEF_OFFSET
+    out /= _AEF_SCALE
+    neg = out < 0
+    np.abs(out, out=out)
+    np.power(out, _AEF_POWER, out=out)
+    out[neg] *= -1
+    return out
+
+
 def build_tile_features(
     tile: TileData,
     target_years: tuple[int, ...],
@@ -238,7 +274,7 @@ def build_tile_features(
     s1_desc_avail = (~np.all(np.isnan(tile.s1_descending_data), axis=0)).astype(np.float32)
 
     # --- AEF ---
-    aef_yearly = _align_yearly_observations(tile.aef_data, tile.aef_year, target_years)
+    aef_yearly = _align_yearly_observations(_dequantize_aef(tile.aef_data), tile.aef_year, target_years)
     aef_mean = _safe_nanmean(aef_yearly, axis=0)
     aef_delta = aef_yearly[-1] - aef_yearly[0]
     aef_yearly_flat = aef_yearly.reshape(-1, *tile.forest_mask.shape)
@@ -356,6 +392,8 @@ def _load_feature_cache(
         z = zarr.open_group(str(path), mode="r")
         if list(z.attrs.get("target_years", [])) != list(target_years):
             return None
+        if int(z.attrs.get("cache_version", 1)) != _FEATURE_CACHE_VERSION:
+            return None
         feature_cube = z["cube"][:].astype(np.float32)
         feature_names = tuple(z.attrs["feature_names"])
         persistence_score = z["persistence_score"][:].astype(np.float32)
@@ -399,6 +437,7 @@ def _save_feature_cache(
             overwrite=True,
         )
         z.attrs["target_years"] = list(target_years)
+        z.attrs["cache_version"] = _FEATURE_CACHE_VERSION
         z.attrs["feature_names"] = list(feature_names)
     except Exception as exc:
         LOGGER.warning("Feature cache save failed for %s: %s", tile_path.name, exc)

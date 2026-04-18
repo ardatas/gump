@@ -7,6 +7,7 @@ import pytest
 
 from src.feature_bank import (
     TileFeatures,
+    _dequantize_aef,
     build_tile_features,
     build_monthly_sequence,
     build_target_months,
@@ -14,6 +15,62 @@ from src.feature_bank import (
     SEQUENCE_CHANNELS,
 )
 from tests.conftest import TARGET_YEARS, H, W, _make_tile
+
+
+class TestDequantizeAef:
+    def test_zero_group_becomes_nan(self):
+        """All-zero 64-dim pixel must be NaN after dequantization."""
+        data = np.zeros((1, 64, 4, 4), dtype=np.float32)
+        out = _dequantize_aef(data)
+        assert np.isnan(out).all()
+
+    def test_nonzero_pixel_is_finite(self):
+        """A pixel with non-zero values must produce finite floats."""
+        data = np.full((1, 64, 4, 4), 127.0, dtype=np.float32)  # maps to 0.0
+        out = _dequantize_aef(data)
+        assert np.isfinite(out).all()
+
+    def test_midpoint_maps_to_zero(self):
+        """Raw value 127 (== OFFSET) should map to exactly 0.0."""
+        data = np.full((1, 64, 2, 2), 127.0, dtype=np.float32)
+        out = _dequantize_aef(data)
+        assert np.allclose(out, 0.0, atol=1e-5)
+
+    def test_output_range_bounded(self):
+        """Values 0 and 255 (extremes) should map to approx -1 and +1."""
+        data = np.zeros((1, 64, 1, 1), dtype=np.float32)
+        data[0, :, 0, 0] = 255.0  # maximum raw value
+        out = _dequantize_aef(data)
+        assert np.allclose(out[0, :, 0, 0], 1.0, atol=0.01)
+
+    def test_sign_preserved(self):
+        """Values below OFFSET should be negative; above should be positive."""
+        data = np.ones((1, 64, 2, 2), dtype=np.float32)
+        data[0, :, 0, :] = 50.0   # below 127 → negative
+        data[0, :, 1, :] = 200.0  # above 127 → positive
+        out = _dequantize_aef(data)
+        assert (out[0, :, 0, :] < 0).all()
+        assert (out[0, :, 1, :] > 0).all()
+
+    def test_output_dtype_float32(self):
+        data = np.full((2, 64, 4, 4), 100.0, dtype=np.float32)
+        out = _dequantize_aef(data)
+        assert out.dtype == np.float32
+
+    def test_raw_values_not_passed_through(self):
+        """After dequantization, AEF features must not be in the 0–255 range."""
+        data = np.full((1, 64, 4, 4), 200.0, dtype=np.float32)
+        out = _dequantize_aef(data)
+        assert out.max() < 2.0, "dequantized values should be near -1..+1, not 0..255"
+
+    def test_aef_features_in_unit_range(self, synthetic_tile):
+        """After dequantization, AEF feature cube values must be near [-1, 1]."""
+        result = build_tile_features(synthetic_tile, TARGET_YEARS, use_cache=False)
+        aef_indices = [i for i, n in enumerate(result.feature_names) if n.startswith("aef_")]
+        aef_block = result.feature_cube[aef_indices]
+        finite = aef_block[np.isfinite(aef_block)]
+        assert finite.max() < 5.0, "AEF values far outside [-1,1] suggest missing dequantization"
+        assert finite.min() > -5.0
 
 
 class TestBuildTileFeatures:
