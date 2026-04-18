@@ -74,6 +74,7 @@ class ResidualMLP(_BinaryHeadModel):
         input_dim: int,
         hidden_dims: tuple[int, ...] = (512, 512, 256, 256, 128),
         dropout: float = 0.2,
+        num_year_classes: int = 0,
     ) -> None:
         super().__init__()
         if not hidden_dims:
@@ -106,12 +107,15 @@ class ResidualMLP(_BinaryHeadModel):
             nn.GELU(),
             nn.Linear(current_dim, 1),
         )
+        self.year_head = nn.Linear(current_dim, num_year_classes) if num_year_classes > 0 else None
+        self.num_year_classes = num_year_classes
 
     def forward(self, features: torch.Tensor, sequence: torch.Tensor | None = None) -> ModelOutputs:  # noqa: ARG002
         hidden = self.input_projection(features)
         hidden = self.stages(hidden)
         logits = self.head(hidden).squeeze(-1)
-        return ModelOutputs(logits=logits)
+        year_logits = self.year_head(hidden) if self.year_head is not None else None
+        return ModelOutputs(logits=logits, year_logits=year_logits)
 
 
 class TemporalConvBlock(nn.Module):
@@ -229,7 +233,7 @@ def build_model(
     if model_name == "mlp":
         return MLPBaseline(input_dim=input_dim, hidden_dims=hidden_dims, dropout=dropout)
     if model_name == "resmlp":
-        return ResidualMLP(input_dim=input_dim, hidden_dims=hidden_dims, dropout=dropout)
+        return ResidualMLP(input_dim=input_dim, hidden_dims=hidden_dims, dropout=dropout, num_year_classes=num_year_classes)
     if model_name == "tcnn":
         if sequence_channels <= 0 or sequence_length <= 0:
             raise ValueError("TemporalCNN requires sequence_channels>0 and sequence_length>0.")
