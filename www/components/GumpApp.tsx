@@ -344,8 +344,8 @@ export default function GumpApp() {
             <button class="popup-action" onclick="window.open('https://www.google.com/maps?q=${lat},${lon}&t=k&z=16','_blank')">🗺 Maps</button>
           </div>
         </div>`, { maxWidth: 320 })
-        lyr.on('mouseover', () => lyr.setStyle({ weight: 3, fillOpacity: 0.8 }))
-        lyr.on('mouseout', () => lyr.setStyle(styleFor(feat)))
+        lyr.on('mouseover', () => (lyr as unknown as { setStyle: (s: object) => void }).setStyle({ weight: 3, fillOpacity: 0.8 }))
+        lyr.on('mouseout', () => (lyr as unknown as { setStyle: (s: object) => void }).setStyle(styleFor(feat)))
       },
     }).addTo(map)
 
