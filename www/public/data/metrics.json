@@ -1,0 +1,15 @@
+{
+  "status": "placeholder",
+  "model": "Baseline MLP (82 features)",
+  "overall": {
+    "f1": null,
+    "precision": null,
+    "recall": null,
+    "pr_auc": null
+  },
+  "per_region": {},
+  "threshold": 0.5,
+  "n_tiles_train": 0,
+  "n_tiles_val": 0,
+  "val_split_strategy": "MGRS-Grid held-out (leakage-frei)"
+}
