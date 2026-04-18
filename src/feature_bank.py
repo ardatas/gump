@@ -540,29 +540,24 @@ def compute_persistence_targets(
     labels = raw_labels.astype(np.uint8)
     weights = raw_weights.astype(np.float32).copy()
 
-    strong_consensus = votes >= 2
-    triple_consensus = votes == 3
-    single_source = votes == 1
-
-    refined_positive = (
-        (strong_consensus & (persistence_score >= 0.20))
-        | (triple_consensus)
-        | (single_source & (persistence_score >= 0.55))
-    )
-    refined_positive &= forest_mask
-
     weights[~forest_mask] = 0.0
 
-    ambiguous_alert = (labels == 1) & ~refined_positive
-    weights[ambiguous_alert] *= 0.35
+    # Use raw consensus labels (≥2 sources agree) as training targets.
+    # Gating by spectral thresholds here creates circular feature-label leakage
+    # and causes the model to fail on non-tropical biomes where NDVI/NBR drop
+    # patterns differ from the training region.  The persistence score is still
+    # present as a feature, so the model can learn to use it as one signal.
+    training_labels = labels.astype(np.uint8)
 
-    likely_unlabeled_positive = (votes == 0) & forest_mask & (persistence_score >= 0.80)
+    # Suppress pixels flagged as positive by only one source AND showing no
+    # spectral signal at all — these are likely labelling artefacts.
+    single_source_no_signal = (votes == 1) & (labels == 0) & (persistence_score < 0.05)
+    weights[single_source_no_signal] *= 0.5
+
+    # Zero-weight likely-unlabelled positives (high spectral drop but no alert):
+    # the model should not learn them as negatives since they may be real events.
+    likely_unlabeled_positive = (votes == 0) & forest_mask & (persistence_score >= 0.75)
     weights[likely_unlabeled_positive] = 0.0
-
-    medium_persistence_single_source = single_source & (persistence_score >= 0.35) & (persistence_score < 0.55)
-    weights[medium_persistence_single_source] *= 0.5
-
-    training_labels = refined_positive.astype(np.uint8)
 
     return PersistenceTargets(
         training_labels=training_labels,
