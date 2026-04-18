@@ -12,6 +12,7 @@ from rasterio.enums import Resampling
 from tqdm import tqdm
 import zarr
 
+from .data.forest_mask import get_or_build_forest_mask   # --- NEU ---
 from .features import compute_forest_mask, linear_backscatter_to_db
 from .index import TileSources, discover_tiles
 from .labels import build_label_products
@@ -49,6 +50,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--forest-mask-year", type=int, default=2020)
     parser.add_argument("--forest-threshold", type=float, default=0.6)
     parser.add_argument("--forest-min-observations", type=int, default=3)
+    # --- NEU: Hansen GFC ---
+    parser.add_argument(
+        "--hansen-cache-dir",
+        type=Path,
+        default=None,
+        help="Directory for Hansen treecover2020 GeoTIFFs. "
+             "Defaults to <cache-root>/forest_masks.",
+    )
+    parser.add_argument(
+        "--hansen-threshold",
+        type=int,
+        default=30,
+        help="Minimum treecover %% to classify as forest (default: 30).",
+    )
+    parser.add_argument(
+        "--no-hansen",
+        action="store_true",
+        help="Skip Hansen GFC download; fall back to NDVI threshold mask.",
+    )
     parser.add_argument("--red-band-index", type=int, default=4)
     parser.add_argument("--nir-band-index", type=int, default=8)
     parser.add_argument("--log-level", default="INFO")
@@ -117,15 +137,32 @@ def preprocess_tile(tile: TileSources, args: argparse.Namespace) -> Path:
     write_s1_group(root, "descending", tile.s1_descending, grid)
     write_aef_group(root, tile, grid)
 
-    forest_mask = compute_forest_mask(
-        tile.s2,
-        grid,
-        year=args.forest_mask_year,
-        red_band_index=args.red_band_index,
-        nir_band_index=args.nir_band_index,
-        ndvi_threshold=args.forest_threshold,
-        min_observations=args.forest_min_observations,
-    )
+    # --- GEÄNDERT: Hansen GFC treecover2020 ersetzt NDVI-Approximation ---
+    if args.no_hansen:
+        forest_mask = compute_forest_mask(
+            tile.s2,
+            grid,
+            year=args.forest_mask_year,
+            red_band_index=args.red_band_index,
+            nir_band_index=args.nir_band_index,
+            ndvi_threshold=args.forest_threshold,
+            min_observations=args.forest_min_observations,
+        )
+    else:
+        hansen_cache = args.hansen_cache_dir or (args.cache_root / "forest_masks")
+        tile_meta = {
+            "crs":       grid.crs,
+            "transform": grid.transform,
+            "shape":     (grid.height, grid.width),
+        }
+        forest_mask = get_or_build_forest_mask(
+            tile.tile_id,
+            tile_meta,
+            cache_dir=hansen_cache,
+            threshold=args.hansen_threshold,
+            ndvi_fallback_observations=tile.s2,   # NDVI fallback if Hansen unreachable
+        )
+    # --- ENDE GEÄNDERT ---
     root.create_dataset(
         "forest_2020",
         data=forest_mask.astype(bool),
