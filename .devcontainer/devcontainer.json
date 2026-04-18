@@ -1,0 +1,6 @@
+{
+  "name": "gump",
+  "image": "warpdotdev/dev-base:latest",
+  "postCreateCommand": "pip install --no-input -r requirements.txt && pip install --no-input torch --index-url https://download.pytorch.org/whl/cpu && (cd www && npm ci --no-audit --no-fund)",
+  "remoteUser": "root"
+}

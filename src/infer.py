@@ -60,9 +60,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold-override", type=float)
     parser.add_argument("--per-region-thresholds", type=Path, help="Optional JSON mapping region -> threshold.")
     parser.add_argument("--save-probabilities", action="store_true")
+    # Default postprocessing below was tuned down after observing that the
+    # previous defaults (closing=2, opening=1, min_area=0.5) shrank or deleted
+    # small real clearings (smallholder deforestation is often 0.1-0.3 ha).
+    # Keep the flags explicit so ablations via `src.evaluate` remain possible.
     parser.add_argument("--closing-radius", type=int, default=1)
-    parser.add_argument("--opening-radius", type=int, default=1)
-    parser.add_argument("--min-area-ha", type=float, default=0.5)
+    parser.add_argument("--opening-radius", type=int, default=0)
+    parser.add_argument("--min-area-ha", type=float, default=0.2)
     parser.add_argument("--min-hole-area-ha", type=float, default=0.0)
     parser.add_argument("--persistence-threshold", type=float, default=0.0)
     parser.add_argument("--predict-time-step", action="store_true", help="Use the alert_year head (if present) to fill the time_step GeoJSON field.")
@@ -127,7 +131,13 @@ def main() -> None:
 
         ensemble_probabilities = np.zeros(feature_matrix.shape[0], dtype=np.float32)
         for bundle in bundles:
-            normalized = normalize_features(feature_matrix, bundle.normalizer)
+            bundle_features = _select_checkpoint_features(
+                feature_matrix,
+                current_feature_names=tile_features.feature_names,
+                checkpoint_feature_names=bundle.feature_names,
+                checkpoint_path=bundle.path,
+            )
+            normalized = normalize_features(bundle_features, bundle.normalizer)
             bundle_sequence = sequence_matrix if bundle.sequence_channels > 0 else None
             tile_probabilities = predict_probabilities(
                 model=bundle.model,
@@ -167,7 +177,13 @@ def main() -> None:
 
         time_step_map = None
         if args.predict_time_step and year_bundle is not None and feature_matrix.shape[0] > 0:
-            normalized_year = normalize_features(feature_matrix, year_bundle.normalizer)
+            year_features = _select_checkpoint_features(
+                feature_matrix,
+                current_feature_names=tile_features.feature_names,
+                checkpoint_feature_names=year_bundle.feature_names,
+                checkpoint_path=year_bundle.path,
+            )
+            normalized_year = normalize_features(year_features, year_bundle.normalizer)
             year_logits = predict_year_logits(
                 model=year_bundle.model,
                 features=normalized_year,
@@ -259,6 +275,35 @@ def _load_per_region_thresholds(path: Path | None) -> dict[str, float]:
         return {}
     raw = json.loads(path.read_text())
     return {str(region): float(value) for region, value in raw.items()}
+
+
+def _select_checkpoint_features(
+    feature_matrix: np.ndarray,
+    *,
+    current_feature_names: tuple[str, ...],
+    checkpoint_feature_names: tuple[str, ...],
+    checkpoint_path: Path,
+) -> np.ndarray:
+    if not checkpoint_feature_names:
+        return feature_matrix
+    if checkpoint_feature_names == current_feature_names:
+        return feature_matrix
+
+    index_by_name = {name: index for index, name in enumerate(current_feature_names)}
+    missing = [name for name in checkpoint_feature_names if name not in index_by_name]
+    if missing:
+        missing_preview = ", ".join(missing[:8])
+        if len(missing) > 8:
+            missing_preview += ", ..."
+        raise SystemExit(
+            f"Checkpoint {checkpoint_path} expects missing features: {missing_preview}"
+        )
+
+    indices = np.asarray(
+        [index_by_name[name] for name in checkpoint_feature_names],
+        dtype=np.int64,
+    )
+    return feature_matrix[:, indices]
 
 
 def _attach_time_step_to_geojson(

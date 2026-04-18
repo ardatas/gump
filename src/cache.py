@@ -46,7 +46,7 @@ def list_tile_paths(cache_root: Path, split: str) -> list[Path]:
     return sorted(
         path
         for path in (cache_root / split).glob("*.zarr")
-        if path.is_dir()
+        if path.is_dir() and not path.name.endswith(".features.zarr")
     )
 
 
