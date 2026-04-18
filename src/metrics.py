@@ -53,6 +53,30 @@ def find_best_threshold(
     return best_threshold, best_metrics
 
 
+def find_best_threshold_per_region(
+    probabilities: np.ndarray,
+    labels: np.ndarray,
+    weights: np.ndarray,
+    regions: np.ndarray,
+    thresholds: np.ndarray | None = None,
+) -> dict[str, tuple[float, dict[str, float]]]:
+    """Return best (threshold, metrics) for each region label."""
+    result: dict[str, tuple[float, dict[str, float]]] = {}
+    unique_regions = np.unique(regions)
+    for region in unique_regions:
+        region_mask = regions == region
+        if not region_mask.any():
+            continue
+        threshold, metrics = find_best_threshold(
+            probabilities[region_mask],
+            labels[region_mask],
+            weights[region_mask],
+            thresholds=thresholds,
+        )
+        result[str(region)] = (threshold, metrics)
+    return result
+
+
 def weighted_average_precision(
     labels: np.ndarray,
     probabilities: np.ndarray,
