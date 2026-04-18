@@ -159,6 +159,7 @@ export default function GumpApp() {
   const [composite, setComposite] = useState<Composite>('rgb')
   const [selectedMonth, setSelectedMonth] = useState<number | null>(null) // null = auto
   const [satelliteLoading, setSatelliteLoading] = useState(false)
+  const [predictionsVisible, setPredictionsVisible] = useState(true)
 
   const showToast = useCallback((msg: string) => {
     setToast(msg); clearTimeout(toastTimer.current)
@@ -288,6 +289,17 @@ export default function GumpApp() {
 
   // Reset month selection when tile changes
   useEffect(() => { setSelectedMonth(null) }, [activeTileIdx])
+
+  // Show/hide prediction layers
+  useEffect(() => {
+    filesRef.current.forEach(f => {
+      if (predictionsVisible) {
+        leafletMap.current && f.visible && f.layer.addTo(leafletMap.current)
+      } else {
+        f.layer.remove()
+      }
+    })
+  }, [predictionsVisible])
 
   // Satellite preview overlay
   useEffect(() => {
@@ -545,7 +557,19 @@ export default function GumpApp() {
       <aside className="sidebar">
         {availableTiles.length > 0 && (
           <section className="panel">
-            <h2>Tile Navigator</h2>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+              <h2 style={{ margin: 0 }}>Tile Navigator</h2>
+              <button
+                title={predictionsVisible ? 'Predictions ausblenden' : 'Predictions einblenden'}
+                onClick={() => setPredictionsVisible(v => !v)}
+                style={{
+                  padding: '3px 8px', fontSize: 11, borderRadius: 4, cursor: 'pointer', border: '1px solid',
+                  borderColor: predictionsVisible ? '#38bdf8' : 'var(--border,#334155)',
+                  background: predictionsVisible ? 'rgba(56,189,248,0.15)' : 'transparent',
+                  color: predictionsVisible ? '#38bdf8' : 'var(--text-dim,#94a3b8)',
+                }}
+              >{predictionsVisible ? '● Predictions' : '○ Predictions'}</button>
+            </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
               <button className="btn" style={{ padding: '4px 10px', minWidth: 32 }}
                 onClick={() => jumpToTile((activeTileIdx ?? 0) - 1)}>‹</button>
