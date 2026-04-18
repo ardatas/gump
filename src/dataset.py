@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 
 import numpy as np
 import torch
@@ -8,6 +9,9 @@ from torch.utils.data import Dataset
 
 from .cache import TileMetadata
 from .feature_bank import TileFeatures
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -41,8 +45,17 @@ def sample_tile_training_data(
     *,
     negative_ratio: float,
     max_samples_per_tile: int | None = None,
+    max_positives_per_tile: int | None = None,
     negatives_if_no_positive: int = 100_000,
 ) -> TileTrainingSamples:
+    """Sample training pixels from a single tile.
+
+    Args:
+        max_positives_per_tile: Cap positive pixels per tile before applying
+            ``negative_ratio``. This ensures that tiles with very high positive
+            rates (e.g. 35%) do not dominate training over tiles with low positive
+            rates (e.g. 0.08%). When set, ``max_samples_per_tile`` is ignored.
+    """
     if tile_features.labels is None or tile_features.weights is None:
         raise ValueError(f"Tile {metadata.tile_id} does not contain training labels.")
 
@@ -56,19 +69,23 @@ def sample_tile_training_data(
     if pos_coords.size == 0 and neg_coords.size == 0:
         raise ValueError(f"Tile {metadata.tile_id} does not contain trainable pixels.")
 
-    if pos_coords.shape[0] > 0:
-        target_negatives = int(round(pos_coords.shape[0] * negative_ratio))
+    if max_positives_per_tile is not None and pos_coords.shape[0] > max_positives_per_tile:
+        keep = rng.choice(pos_coords.shape[0], size=max_positives_per_tile, replace=False)
+        sampled_positives = pos_coords[keep]
+    else:
+        sampled_positives = pos_coords
+
+    if sampled_positives.shape[0] > 0:
+        target_negatives = int(round(sampled_positives.shape[0] * negative_ratio))
     else:
         target_negatives = min(neg_coords.shape[0], negatives_if_no_positive)
 
     sampled_negatives = _sample_rows(neg_coords, target_negatives, rng)
-    sampled_positives = pos_coords
-
     all_coords = np.concatenate([sampled_positives, sampled_negatives], axis=0)
     if all_coords.size == 0:
         raise ValueError(f"Tile {metadata.tile_id} produced no sampled pixels.")
 
-    if max_samples_per_tile is not None and all_coords.shape[0] > max_samples_per_tile:
+    if max_positives_per_tile is None and max_samples_per_tile is not None and all_coords.shape[0] > max_samples_per_tile:
         if sampled_positives.shape[0] >= max_samples_per_tile:
             keep_pos = rng.choice(sampled_positives.shape[0], size=max_samples_per_tile, replace=False)
             all_coords = sampled_positives[keep_pos]
@@ -105,6 +122,154 @@ def build_eval_matrix(tile_features: TileFeatures) -> tuple[np.ndarray, np.ndarr
     labels = tile_features.labels[rows, cols].astype(np.float32)
     weights = tile_features.weights[rows, cols].astype(np.float32)
     return features, labels, weights, eval_mask
+
+
+class PatchDataset(Dataset):
+    """Patch-based dataset for spatial models (e.g. U-Net).
+
+    Samples ``patches_per_tile`` patches per tile, split by ``pos_fraction``
+    into patches centred on a deforested pixel vs. patches centred on a
+    forest-but-not-deforested pixel.  Patches that would extend outside the
+    tile boundary are zero-padded (weight=0 on the padded margin).
+
+    Output per sample: (features, labels, weights) with shapes
+    ``(C, patch_size, patch_size)``, ``(patch_size, patch_size)``,
+    ``(patch_size, patch_size)``.
+    """
+
+    def __init__(
+        self,
+        tile_features_list: list[TileFeatures],
+        patch_size: int = 128,
+        patches_per_tile: int = 200,
+        pos_fraction: float = 0.5,
+        augment: bool = True,
+        seed: int = 42,
+    ) -> None:
+        self._tile_features = tile_features_list
+        self._patch_size = patch_size
+        self._augment = augment
+        rng = np.random.default_rng(seed)
+        # List of (tile_idx, row_center, col_center)
+        self._patches: list[tuple[int, int, int]] = []
+
+        for tile_idx, tf in enumerate(tile_features_list):
+            if tf.labels is None or tf.weights is None:
+                continue
+            valid = tf.forest_mask & (tf.weights > 0)
+            pos_mask = valid & (tf.labels == 1)
+            neg_mask = valid & (tf.labels == 0)
+
+            h, w = tf.forest_mask.shape
+            half = patch_size // 2
+            r_min, r_max = half, h - half
+            c_min, c_max = half, w - half
+            if r_min >= r_max or c_min >= c_max:
+                LOGGER.warning("Tile %d too small for patch_size=%d, skipping.", tile_idx, patch_size)
+                continue
+
+            n_pos = int(patches_per_tile * pos_fraction)
+            n_neg = patches_per_tile - n_pos
+
+            def _sample_centers(mask: np.ndarray, n: int) -> np.ndarray:
+                coords = np.column_stack(np.nonzero(mask))
+                if coords.shape[0] == 0:
+                    return coords
+                in_range = (
+                    (coords[:, 0] >= r_min) & (coords[:, 0] < r_max) &
+                    (coords[:, 1] >= c_min) & (coords[:, 1] < c_max)
+                )
+                coords = coords[in_range]
+                if coords.shape[0] == 0:
+                    return coords
+                size = min(n, coords.shape[0])
+                return coords[rng.choice(coords.shape[0], size=size, replace=False)]
+
+            for r, c in _sample_centers(pos_mask, n_pos):
+                self._patches.append((tile_idx, int(r), int(c)))
+            for r, c in _sample_centers(neg_mask, n_neg):
+                self._patches.append((tile_idx, int(r), int(c)))
+
+        rng.shuffle(self._patches)
+        LOGGER.info("PatchDataset: %d patches from %d tiles.", len(self._patches), len(tile_features_list))
+
+    def __len__(self) -> int:
+        return len(self._patches)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        tile_idx, r, c = self._patches[index]
+        tf = self._tile_features[tile_idx]
+        half = self._patch_size // 2
+        r0, r1 = r - half, r + half
+        c0, c1 = c - half, c + half
+
+        features_patch = tf.feature_cube[:, r0:r1, c0:c1].astype(np.float32)
+        labels_patch = (
+            tf.labels[r0:r1, c0:c1].astype(np.float32)
+            if tf.labels is not None
+            else np.zeros((r1 - r0, c1 - c0), dtype=np.float32)
+        )
+        weights_patch = (
+            tf.weights[r0:r1, c0:c1].astype(np.float32)
+            if tf.weights is not None
+            else np.zeros((r1 - r0, c1 - c0), dtype=np.float32)
+        )
+
+        # Pad if patch goes out of bounds (safety net)
+        if features_patch.shape[1] != self._patch_size or features_patch.shape[2] != self._patch_size:
+            features_patch, labels_patch, weights_patch = _pad_to_size(
+                features_patch, labels_patch, weights_patch, self._patch_size
+            )
+
+        if self._augment:
+            features_patch, labels_patch, weights_patch = _augment_patch(
+                features_patch, labels_patch, weights_patch
+            )
+
+        return (
+            torch.from_numpy(features_patch),
+            torch.from_numpy(labels_patch),
+            torch.from_numpy(weights_patch),
+        )
+
+
+def _pad_to_size(
+    features: np.ndarray,
+    labels: np.ndarray,
+    weights: np.ndarray,
+    target: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ph = max(0, target - features.shape[1])
+    pw = max(0, target - features.shape[2])
+    if ph > 0 or pw > 0:
+        features = np.pad(features, ((0, 0), (0, ph), (0, pw)), constant_values=0.0)
+        labels = np.pad(labels, ((0, ph), (0, pw)), constant_values=0.0)
+        weights = np.pad(weights, ((0, ph), (0, pw)), constant_values=0.0)
+    return features, labels, weights
+
+
+def _augment_patch(
+    features: np.ndarray,
+    labels: np.ndarray,
+    weights: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    # Random horizontal flip
+    if np.random.random() > 0.5:
+        features = features[:, :, ::-1].copy()
+        labels = labels[:, ::-1].copy()
+        weights = weights[:, ::-1].copy()
+    # Random vertical flip
+    if np.random.random() > 0.5:
+        features = features[:, ::-1, :].copy()
+        labels = labels[::-1, :].copy()
+        weights = weights[::-1, :].copy()
+    # Random 90° rotation (0/90/180/270)
+    k = np.random.randint(0, 4)
+    if k > 0:
+        features = np.rot90(features, k=k, axes=(1, 2)).copy()
+        labels = np.rot90(labels, k=k).copy()
+        weights = np.rot90(weights, k=k).copy()
+    return features, labels, weights
 
 
 def _sample_rows(array: np.ndarray, count: int, rng: np.random.Generator) -> np.ndarray:

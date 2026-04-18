@@ -1,18 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import logging
+from pathlib import Path
 import warnings
 
+import numcodecs
 import numpy as np
+import zarr
 
 from .cache import TileData
 
+
+LOGGER = logging.getLogger(__name__)
 
 S2_SCALE = 10_000.0
 S2_RED_INDEX = 3
 S2_NIR_INDEX = 7
 S2_SWIR1_INDEX = 10
 S2_SWIR2_INDEX = 11
+
+_CACHE_COMPRESSOR = numcodecs.Blosc(cname="zstd", clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
 
 
 @dataclass(frozen=True)
@@ -24,7 +33,25 @@ class TileFeatures:
     weights: np.ndarray | None
 
 
-def build_tile_features(tile: TileData, target_years: tuple[int, ...]) -> TileFeatures:
+def build_tile_features(
+    tile: TileData,
+    target_years: tuple[int, ...],
+    *,
+    use_cache: bool = True,
+) -> TileFeatures:
+    if use_cache:
+        cached = _load_feature_cache(tile.metadata.path, target_years)
+        if cached is not None:
+            feature_cube, feature_names = cached
+            return TileFeatures(
+                feature_cube=feature_cube,
+                feature_names=feature_names,
+                forest_mask=tile.forest_mask,
+                labels=tile.label_consensus,
+                weights=tile.label_weight,
+            )
+
+    # --- S2 ---
     s2 = tile.s2_data / S2_SCALE
     s2_yearly = _yearly_reduce(s2, tile.s2_year, target_years, reducer="median")
     s2_std = _safe_nanstd(s2, axis=0)
@@ -48,17 +75,26 @@ def build_tile_features(tile: TileData, target_years: tuple[int, ...]) -> TileFe
         axis=0,
     )
 
-    s1_asc = _yearly_reduce(tile.s1_ascending_data, tile.s1_ascending_year, target_years, reducer="median")
-    s1_desc = _yearly_reduce(tile.s1_descending_data, tile.s1_descending_year, target_years, reducer="median")
+    # --- S1: impute NaN with per-pixel temporal median before aggregation ---
+    s1_asc_imputed = _impute_nan_with_median(tile.s1_ascending_data)
+    s1_desc_imputed = _impute_nan_with_median(tile.s1_descending_data)
+
+    s1_asc = _yearly_reduce(s1_asc_imputed, tile.s1_ascending_year, target_years, reducer="median")
+    s1_desc = _yearly_reduce(s1_desc_imputed, tile.s1_descending_year, target_years, reducer="median")
     s1_delta = np.concatenate([s1_asc[-1] - s1_asc[0], s1_desc[-1] - s1_desc[0]], axis=0)
     s1_std = np.concatenate(
         [
-            _reduce_or_zeros(tile.s1_ascending_data, reducer="std"),
-            _reduce_or_zeros(tile.s1_descending_data, reducer="std"),
+            _reduce_or_zeros(s1_asc_imputed, reducer="std"),
+            _reduce_or_zeros(s1_desc_imputed, reducer="std"),
         ],
         axis=0,
     )
 
+    # S1 data-availability flags: 1 where original data existed, 0 where it was all-NaN
+    s1_asc_avail = (~np.all(np.isnan(tile.s1_ascending_data), axis=0)).astype(np.float32)
+    s1_desc_avail = (~np.all(np.isnan(tile.s1_descending_data), axis=0)).astype(np.float32)
+
+    # --- AEF ---
     aef_yearly = _align_yearly_observations(tile.aef_data, tile.aef_year, target_years)
     aef_mean = _safe_nanmean(aef_yearly, axis=0)
     aef_delta = aef_yearly[-1] - aef_yearly[0]
@@ -74,6 +110,8 @@ def build_tile_features(tile: TileData, target_years: tuple[int, ...]) -> TileFe
         s1_desc.reshape(-1, *tile.forest_mask.shape),
         s1_delta,
         s1_std,
+        s1_asc_avail,
+        s1_desc_avail,
         aef_mean,
         aef_delta,
     ]
@@ -90,9 +128,13 @@ def build_tile_features(tile: TileData, target_years: tuple[int, ...]) -> TileFe
         + tuple(f"s1_asc_median_y{year}" for year in target_years)
         + tuple(f"s1_desc_median_y{year}" for year in target_years)
         + ("s1_asc_delta", "s1_desc_delta", "s1_asc_std", "s1_desc_std")
+        + ("s1_asc_avail", "s1_desc_avail")
         + tuple(f"aef_mean_{index:02d}" for index in range(64))
         + tuple(f"aef_delta_{index:02d}" for index in range(64))
     )
+
+    if use_cache:
+        _save_feature_cache(tile.metadata.path, target_years, feature_cube, feature_names)
 
     return TileFeatures(
         feature_cube=feature_cube,
@@ -101,6 +143,127 @@ def build_tile_features(tile: TileData, target_years: tuple[int, ...]) -> TileFe
         labels=tile.label_consensus,
         weights=tile.label_weight,
     )
+
+
+def _cache_path(tile_path: Path) -> Path:
+    return tile_path.parent / (tile_path.stem + ".features.zarr")
+
+
+def _load_feature_cache(
+    tile_path: Path,
+    target_years: tuple[int, ...],
+) -> tuple[np.ndarray, tuple[str, ...]] | None:
+    path = _cache_path(tile_path)
+    if not path.exists():
+        return None
+    try:
+        z = zarr.open_group(str(path), mode="r")
+        if list(z.attrs.get("target_years", [])) != list(target_years):
+            return None
+        feature_cube = z["cube"][:].astype(np.float32)
+        feature_names = tuple(z.attrs["feature_names"])
+        return feature_cube, feature_names
+    except Exception as exc:
+        LOGGER.warning("Feature cache load failed for %s: %s", tile_path.name, exc)
+        return None
+
+
+def _save_feature_cache(
+    tile_path: Path,
+    target_years: tuple[int, ...],
+    feature_cube: np.ndarray,
+    feature_names: tuple[str, ...],
+) -> None:
+    path = _cache_path(tile_path)
+    try:
+        z = zarr.open_group(str(path), mode="w")
+        z.create_dataset(
+            "cube",
+            data=feature_cube,
+            chunks=(1, 256, 256),
+            compressor=_CACHE_COMPRESSOR,
+            overwrite=True,
+        )
+        z.attrs["target_years"] = list(target_years)
+        z.attrs["feature_names"] = list(feature_names)
+    except Exception as exc:
+        LOGGER.warning("Feature cache save failed for %s: %s", tile_path.name, exc)
+
+
+def compute_feature_norm_stats(
+    tile_paths: list[Path],
+    target_years: tuple[int, ...],
+    output_path: Path,
+) -> None:
+    """Compute per-feature mean/std from a list of tile zarr paths and save as JSON.
+
+    Loads feature cubes (using cache if available) and computes running statistics
+    over all valid (forest & weight>0) pixels across all tiles.
+    """
+    from .cache import load_tile_data
+
+    sum_x = None
+    sum_x2 = None
+    count = 0
+
+    for tile_path in tile_paths:
+        LOGGER.info("Computing norm stats for %s", tile_path.name)
+        tile = load_tile_data(tile_path)
+        tf = build_tile_features(tile, target_years)
+        valid = tf.forest_mask
+        if tf.weights is not None:
+            valid = valid & (tf.weights > 0)
+        rows, cols = np.nonzero(valid)
+        if rows.size == 0:
+            continue
+        samples = tf.feature_cube[:, rows, cols].T  # (N, C)
+        if sum_x is None:
+            n_features = samples.shape[1]
+            sum_x = np.zeros(n_features, dtype=np.float64)
+            sum_x2 = np.zeros(n_features, dtype=np.float64)
+        sum_x += samples.sum(axis=0).astype(np.float64)
+        sum_x2 += (samples ** 2).sum(axis=0).astype(np.float64)
+        count += samples.shape[0]
+
+    if sum_x is None or count == 0:
+        raise ValueError("No valid pixels found across provided tiles.")
+
+    mean = (sum_x / count).astype(np.float32)
+    variance = (sum_x2 / count - (sum_x / count) ** 2).astype(np.float32)
+    std = np.sqrt(np.maximum(variance, 0.0)).astype(np.float32)
+    std[std < 1e-6] = 1.0
+
+    # Get feature names from last tile
+    tile = load_tile_data(tile_paths[-1])
+    tf = build_tile_features(tile, target_years)
+    feature_names = list(tf.feature_names)
+
+    stats = {
+        "n_pixels": int(count),
+        "n_features": int(len(mean)),
+        "feature_names": feature_names,
+        "mean": mean.tolist(),
+        "std": std.tolist(),
+    }
+    output_path.write_text(json.dumps(stats, indent=2))
+    LOGGER.info("Saved feature norm stats (%d features, %d pixels) to %s", len(mean), count, output_path)
+
+
+def _impute_nan_with_median(data: np.ndarray) -> np.ndarray:
+    """Replace NaN values with per-pixel temporal median; fall back to global median."""
+    if not np.isnan(data).any():
+        return data
+    out = data.copy()
+    # Per-pixel median across time (axis=0): shape (C, H, W) or (1, H, W)
+    pixel_median = _safe_nanmedian(data, axis=0)
+    # Global fallback for pixels that are always NaN
+    finite_vals = data[np.isfinite(data)]
+    global_median = float(np.median(finite_vals)) if finite_vals.size > 0 else 0.0
+    pixel_median = np.where(np.isnan(pixel_median), global_median, pixel_median)
+    # Broadcast pixel_median to (T, C, H, W) and fill NaN positions
+    nan_mask = np.isnan(out)
+    out[nan_mask] = np.broadcast_to(pixel_median[np.newaxis], out.shape)[nan_mask]
+    return out
 
 
 def _yearly_reduce(
