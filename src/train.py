@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
+from itertools import repeat
 import json
 import logging
 from pathlib import Path
 import random
+from time import perf_counter
 
 import numpy as np
 import torch
@@ -65,6 +69,52 @@ class TemporalConfig:
     aux_year_loss_weight: float
 
 
+@dataclass(frozen=True)
+class PreparedTrainTile:
+    tile_id: str
+    feature_names: tuple[str, ...] | None
+    features: np.ndarray | None
+    labels: np.ndarray | None
+    weights: np.ndarray | None
+    positive_count: int
+    negative_count: int
+    sequences: np.ndarray | None = None
+    year_classes: np.ndarray | None = None
+    year_mask: np.ndarray | None = None
+    skipped_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class PreparedTrainData:
+    features: np.ndarray | torch.Tensor
+    labels: np.ndarray | torch.Tensor
+    weights: np.ndarray | torch.Tensor
+    feature_names: tuple[str, ...]
+    sequences: np.ndarray | torch.Tensor | None = None
+    year_classes: np.ndarray | torch.Tensor | None = None
+    year_mask: np.ndarray | torch.Tensor | None = None
+    device_resident: bool = False
+
+
+@dataclass(frozen=True)
+class PreparedEvalTile:
+    tile_id: str
+    features: np.ndarray | None
+    labels: np.ndarray | None
+    weights: np.ndarray | None
+    sequences: np.ndarray | None = None
+    skipped_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class PreparedEvalData:
+    features: np.ndarray | torch.Tensor
+    labels: np.ndarray
+    weights: np.ndarray
+    sequences: np.ndarray | torch.Tensor | None = None
+    device_resident: bool = False
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a baseline model on preprocessed Zarr caches.")
     parser.add_argument("--cache-root", type=Path, required=True)
@@ -76,13 +126,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--min-learning-rate", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--negative-ratio", type=float, default=1.5)
+    parser.add_argument("--negative-ratio", type=float, default=3.0)
     parser.add_argument("--max-samples-per-tile", type=int, default=500_000)
     parser.add_argument("--val-region", action="append", dest="val_regions", default=[])
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--prep-workers", type=int, default=4)
+    parser.add_argument("--gpu-resident-data", choices=["auto", "always", "never"], default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--log-level", default="INFO")
-    parser.add_argument("--model-name", choices=["mlp", "resmlp", "tcnn"], default="tcnn")
+    parser.add_argument("--model-name", choices=["mlp", "resmlp", "tcnn"], default="resmlp")
     parser.add_argument("--hidden-dims", nargs="+", type=int, default=[512, 512, 256, 256, 128])
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--loss", choices=["bce", "focal", "gce"], default="focal")
@@ -95,11 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--early-stopping-patience", type=int, default=0)
     parser.add_argument("--use-temporal", action="store_true", help="Build monthly sequences (auto when --model-name=tcnn).")
-    parser.add_argument("--aux-year-loss-weight", type=float, default=0.3, help="Multi-task weight for year classification head.")
-    parser.add_argument("--hard-negatives-json", type=Path, default=None,
-                        help="Optional JSON from src.mine_hard_negatives: injects FPs as preferred negatives.")
-    parser.add_argument("--hard-negative-fraction", type=float, default=0.5,
-                        help="Fraction of the negative budget per tile filled from the hard-negatives cache.")
+    parser.add_argument("--aux-year-loss-weight", type=float, default=0.0, help="Multi-task weight for year classification head.")
     parser.add_argument("--resume", type=Path)
     return parser.parse_args()
 
@@ -145,67 +193,6 @@ def main() -> None:
         aux_year_loss_weight=float(args.aux_year_loss_weight),
     )
 
-    rng = np.random.default_rng(args.seed)
-    hard_negatives_map = load_hard_negatives(args.hard_negatives_json)
-    train_feature_chunks: list[np.ndarray] = []
-    train_label_chunks: list[np.ndarray] = []
-    train_weight_chunks: list[np.ndarray] = []
-    train_sequence_chunks: list[np.ndarray] = []
-    train_year_class_chunks: list[np.ndarray] = []
-    train_year_mask_chunks: list[np.ndarray] = []
-    feature_names: tuple[str, ...] | None = None
-
-    for item in train_metadata:
-        LOGGER.info("Building train samples for %s", item.tile_id)
-        tile = load_tile_data(item.path)
-        tile_features = build_tile_features(tile, target_years)
-        feature_names = tile_features.feature_names
-        sequence = build_monthly_sequence(tile, target_months) if use_temporal else None
-        hard_negatives_for_tile = hard_negatives_map.get(item.tile_id) if hard_negatives_map else None
-        try:
-            sampled = sample_tile_training_data(
-                item,
-                tile_features,
-                rng,
-                negative_ratio=args.negative_ratio,
-                max_samples_per_tile=args.max_samples_per_tile,
-                sequence=sequence,
-                year_min=temporal_config.year_min,
-                num_year_classes=temporal_config.num_year_classes,
-                hard_negative_coords=hard_negatives_for_tile,
-                hard_negative_fraction=args.hard_negative_fraction,
-            )
-        except ValueError as exc:
-            LOGGER.warning("Skipping train tile %s: %s", item.tile_id, exc)
-            continue
-        LOGGER.info(
-            "Tile %s sampled %s rows (%s positive candidates, %s negative candidates)",
-            item.tile_id,
-            sampled.features.shape[0],
-            sampled.positive_count,
-            sampled.negative_count,
-        )
-        train_feature_chunks.append(sampled.features)
-        train_label_chunks.append(sampled.labels)
-        train_weight_chunks.append(sampled.weights)
-        if sampled.sequences is not None:
-            train_sequence_chunks.append(sampled.sequences)
-        if sampled.year_classes is not None and sampled.year_mask is not None:
-            train_year_class_chunks.append(sampled.year_classes)
-            train_year_mask_chunks.append(sampled.year_mask)
-
-    if feature_names is None:
-        raise SystemExit("No features were built for training.")
-    if not train_feature_chunks:
-        raise SystemExit("No trainable samples were collected from the cache.")
-
-    raw_train_features = np.concatenate(train_feature_chunks, axis=0)
-    train_labels = np.concatenate(train_label_chunks, axis=0)
-    train_weights = np.concatenate(train_weight_chunks, axis=0)
-    train_sequences = np.concatenate(train_sequence_chunks, axis=0) if train_sequence_chunks else None
-    train_year_classes = np.concatenate(train_year_class_chunks, axis=0) if train_year_class_chunks else None
-    train_year_mask = np.concatenate(train_year_mask_chunks, axis=0) if train_year_mask_chunks else None
-
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     amp_dtype = resolve_amp_dtype(args.amp_dtype, device)
     runtime_config = RuntimeConfig(
@@ -218,9 +205,38 @@ def main() -> None:
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
 
+    train_prep_start = perf_counter()
+    train_data = prepare_train_data(
+        metadata=train_metadata,
+        target_years=target_years,
+        temporal_config=temporal_config,
+        negative_ratio=args.negative_ratio,
+        max_samples_per_tile=args.max_samples_per_tile,
+        seed=args.seed,
+        prep_workers=args.prep_workers,
+    )
+    LOGGER.info(
+        "Prepared %s training rows in %.1fs",
+        train_data.features.shape[0],
+        perf_counter() - train_prep_start,
+    )
+
+    val_prep_start = perf_counter()
+    raw_val_data = prepare_eval_data(
+        metadata=val_metadata,
+        target_years=target_years,
+        temporal_config=temporal_config,
+        prep_workers=args.prep_workers,
+    )
+    LOGGER.info(
+        "Prepared %s validation rows in %.1fs",
+        raw_val_data.features.shape[0],
+        perf_counter() - val_prep_start,
+    )
+
     positive_class_weight = resolve_positive_class_weight(
-        train_labels,
-        train_weights,
+        np.asarray(train_data.labels),
+        np.asarray(train_data.weights),
         user_value=args.positive_class_weight,
         auto_enabled=args.auto_positive_class_weight,
     )
@@ -233,33 +249,65 @@ def main() -> None:
     )
 
     if checkpoint is None:
-        normalizer = fit_normalizer(raw_train_features)
+        normalizer = fit_normalizer(np.asarray(train_data.features))
     else:
         normalizer = load_normalizer(checkpoint)
-    train_features = normalize_features(raw_train_features, normalizer)
+    train_data = PreparedTrainData(
+        features=normalize_features(np.asarray(train_data.features), normalizer),
+        labels=np.asarray(train_data.labels),
+        weights=np.asarray(train_data.weights),
+        feature_names=train_data.feature_names,
+        sequences=(
+            None
+            if train_data.sequences is None
+            else np.asarray(train_data.sequences, dtype=np.float32)
+        ),
+        year_classes=(
+            None
+            if train_data.year_classes is None
+            else np.asarray(train_data.year_classes, dtype=np.int64)
+        ),
+        year_mask=(
+            None
+            if train_data.year_mask is None
+            else np.asarray(train_data.year_mask, dtype=np.float32)
+        ),
+    )
+    val_data = PreparedEvalData(
+        features=normalize_features(np.asarray(raw_val_data.features), normalizer),
+        labels=raw_val_data.labels,
+        weights=raw_val_data.weights,
+        sequences=(
+            None
+            if raw_val_data.sequences is None
+            else np.asarray(raw_val_data.sequences, dtype=np.float32)
+        ),
+    )
 
-    dataset = PixelSampleDataset(
-        train_features,
-        train_labels,
-        train_weights,
-        sequences=train_sequences,
-        year_classes=train_year_classes,
-        year_mask=train_year_mask,
+    use_gpu_resident_data = should_use_gpu_resident_data(
+        mode=args.gpu_resident_data,
+        model_name=args.model_name,
+        temporal_config=temporal_config,
+        device=device,
+        train_data=train_data,
+        val_data=val_data,
     )
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
-        persistent_workers=args.num_workers > 0,
-    )
+    if use_gpu_resident_data:
+        train_data = move_train_data_to_device(train_data, device)
+        val_data = move_eval_data_to_device(val_data, device)
+        loader = None
+    else:
+        loader = build_train_loader(
+            train_data=train_data,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            device=device,
+        )
 
     if checkpoint is None:
         model = build_model(
             args.model_name,
-            input_dim=train_features.shape[1],
+            input_dim=len(train_data.feature_names),
             hidden_dims=args.hidden_dims,
             dropout=args.dropout,
             sequence_channels=sequence_channels,
@@ -306,33 +354,48 @@ def main() -> None:
         target_years=target_years,
         train_metadata=train_metadata,
         val_metadata=val_metadata,
-        feature_names=feature_names,
+        feature_names=train_data.feature_names,
         positive_class_weight=positive_class_weight,
         temporal_config=temporal_config,
     )
 
     epochs_without_improvement = 0
     for epoch in range(start_epoch, args.epochs + 1):
-        train_loss = train_one_epoch(
-            model=model,
-            loader=loader,
-            optimizer=optimizer,
-            runtime_config=runtime_config,
-            loss_config=loss_config,
-            scaler=scaler,
-            temporal_config=temporal_config,
-        )
+        train_start = perf_counter()
+        if train_data.device_resident:
+            train_loss = train_one_epoch_resident(
+                model=model,
+                train_data=train_data,
+                batch_size=args.batch_size,
+                optimizer=optimizer,
+                runtime_config=runtime_config,
+                loss_config=loss_config,
+                scaler=scaler,
+                temporal_config=temporal_config,
+            )
+        else:
+            if loader is None:
+                raise RuntimeError("CPU-resident training path requires a DataLoader.")
+            train_loss = train_one_epoch(
+                model=model,
+                loader=loader,
+                optimizer=optimizer,
+                runtime_config=runtime_config,
+                loss_config=loss_config,
+                scaler=scaler,
+                temporal_config=temporal_config,
+            )
+        train_duration = perf_counter() - train_start
         scheduler.step()
 
-        val_result = evaluate_on_tiles(
+        eval_start = perf_counter()
+        val_result = evaluate_prepared_data(
             model=model,
-            metadata=val_metadata,
-            target_years=target_years,
-            normalizer=normalizer,
+            eval_data=val_data,
             runtime_config=runtime_config,
             batch_size=args.eval_batch_size,
-            temporal_config=temporal_config,
         )
+        eval_duration = perf_counter() - eval_start
         threshold, threshold_metrics = find_best_threshold(
             val_result["probabilities"],
             val_result["labels"],
@@ -365,6 +428,12 @@ def main() -> None:
             threshold_metrics["recall"],
             threshold,
         )
+        LOGGER.info(
+            "Epoch %s timings train=%.1fs eval=%.1fs",
+            epoch,
+            train_duration,
+            eval_duration,
+        )
 
         improved = threshold_metrics["f1"] > best_f1
         checkpoint_best_f1 = threshold_metrics["f1"] if improved else best_f1
@@ -377,7 +446,7 @@ def main() -> None:
             scheduler=scheduler,
             scaler=scaler if scaler.is_enabled() else None,
             normalizer=normalizer,
-            feature_names=feature_names,
+            feature_names=train_data.feature_names,
             target_years=target_years,
             threshold=threshold,
             val_regions=val_regions,
@@ -401,7 +470,7 @@ def main() -> None:
                 scheduler=scheduler,
                 scaler=scaler if scaler.is_enabled() else None,
                 normalizer=normalizer,
-                feature_names=feature_names,
+                feature_names=train_data.feature_names,
                 target_years=target_years,
                 threshold=threshold,
                 val_regions=val_regions,
@@ -432,6 +501,466 @@ def main() -> None:
         )
     )
     LOGGER.info("Saved run to %s", run_dir)
+
+
+def _stable_tile_seed(seed: int, tile_id: str) -> int:
+    digest = hashlib.blake2b(f"{seed}:{tile_id}".encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="little", signed=False)
+
+
+def _resolve_prep_workers(prep_workers: int, item_count: int) -> int:
+    if item_count <= 1:
+        return 1
+    return max(1, min(prep_workers, item_count))
+
+
+def _prepare_train_tile(
+    item: TileMetadata,
+    target_years: tuple[int, ...],
+    temporal_config: TemporalConfig,
+    negative_ratio: float,
+    max_samples_per_tile: int | None,
+    seed: int,
+) -> PreparedTrainTile:
+    tile = load_tile_data(item.path)
+    tile_features = build_tile_features(tile, target_years)
+    sequence = build_monthly_sequence(tile, temporal_config.target_months) if temporal_config.enabled else None
+    rng = np.random.default_rng(_stable_tile_seed(seed, item.tile_id))
+    try:
+        sampled = sample_tile_training_data(
+            item,
+            tile_features,
+            rng,
+            negative_ratio=negative_ratio,
+            max_samples_per_tile=max_samples_per_tile,
+            sequence=sequence,
+            year_min=temporal_config.year_min,
+            num_year_classes=temporal_config.num_year_classes,
+        )
+    except ValueError as exc:
+        return PreparedTrainTile(
+            tile_id=item.tile_id,
+            feature_names=tile_features.feature_names,
+            features=None,
+            labels=None,
+            weights=None,
+            positive_count=0,
+            negative_count=0,
+            skipped_reason=str(exc),
+        )
+
+    return PreparedTrainTile(
+        tile_id=item.tile_id,
+        feature_names=tile_features.feature_names,
+        features=sampled.features,
+        labels=sampled.labels,
+        weights=sampled.weights,
+        positive_count=sampled.positive_count,
+        negative_count=sampled.negative_count,
+        sequences=sampled.sequences,
+        year_classes=sampled.year_classes,
+        year_mask=sampled.year_mask,
+    )
+
+
+def prepare_train_data(
+    *,
+    metadata: list[TileMetadata],
+    target_years: tuple[int, ...],
+    temporal_config: TemporalConfig,
+    negative_ratio: float,
+    max_samples_per_tile: int | None,
+    seed: int,
+    prep_workers: int,
+) -> PreparedTrainData:
+    worker_count = _resolve_prep_workers(prep_workers, len(metadata))
+    LOGGER.info("Preparing %s train tiles with %s worker(s)", len(metadata), worker_count)
+
+    results: list[PreparedTrainTile]
+    if worker_count == 1:
+        results = [
+            _prepare_train_tile(
+                item,
+                target_years,
+                temporal_config,
+                negative_ratio,
+                max_samples_per_tile,
+                seed,
+            )
+            for item in metadata
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            results = list(
+                executor.map(
+                    _prepare_train_tile,
+                    metadata,
+                    repeat(target_years),
+                    repeat(temporal_config),
+                    repeat(negative_ratio),
+                    repeat(max_samples_per_tile),
+                    repeat(seed),
+                )
+            )
+
+    feature_names: tuple[str, ...] | None = None
+    feature_chunks: list[np.ndarray] = []
+    label_chunks: list[np.ndarray] = []
+    weight_chunks: list[np.ndarray] = []
+    sequence_chunks: list[np.ndarray] = []
+    year_class_chunks: list[np.ndarray] = []
+    year_mask_chunks: list[np.ndarray] = []
+
+    for result in results:
+        if result.feature_names is not None and feature_names is None:
+            feature_names = result.feature_names
+        if result.skipped_reason is not None:
+            LOGGER.warning("Skipping train tile %s: %s", result.tile_id, result.skipped_reason)
+            continue
+        if feature_names is not None and result.feature_names != feature_names:
+            raise ValueError(f"Feature names mismatch for train tile {result.tile_id}")
+        if result.features is None or result.labels is None or result.weights is None:
+            raise ValueError(f"Train tile {result.tile_id} did not return sample arrays.")
+        LOGGER.info(
+            "Tile %s sampled %s rows (%s positive candidates, %s negative candidates)",
+            result.tile_id,
+            result.features.shape[0],
+            result.positive_count,
+            result.negative_count,
+        )
+        feature_chunks.append(result.features)
+        label_chunks.append(result.labels)
+        weight_chunks.append(result.weights)
+        if result.sequences is not None:
+            sequence_chunks.append(result.sequences)
+        if result.year_classes is not None and result.year_mask is not None:
+            year_class_chunks.append(result.year_classes)
+            year_mask_chunks.append(result.year_mask)
+
+    if feature_names is None:
+        raise SystemExit("No features were built for training.")
+    if not feature_chunks:
+        raise SystemExit("No trainable samples were collected from the cache.")
+
+    return PreparedTrainData(
+        features=np.concatenate(feature_chunks, axis=0),
+        labels=np.concatenate(label_chunks, axis=0),
+        weights=np.concatenate(weight_chunks, axis=0),
+        feature_names=feature_names,
+        sequences=np.concatenate(sequence_chunks, axis=0) if sequence_chunks else None,
+        year_classes=np.concatenate(year_class_chunks, axis=0) if year_class_chunks else None,
+        year_mask=np.concatenate(year_mask_chunks, axis=0) if year_mask_chunks else None,
+    )
+
+
+def _prepare_eval_tile(
+    item: TileMetadata,
+    target_years: tuple[int, ...],
+    temporal_config: TemporalConfig,
+) -> PreparedEvalTile:
+    tile = load_tile_data(item.path)
+    tile_features = build_tile_features(tile, target_years)
+    try:
+        feature_matrix, tile_labels, tile_weights, _ = build_eval_matrix(tile_features)
+    except ValueError as exc:
+        return PreparedEvalTile(
+            tile_id=item.tile_id,
+            features=None,
+            labels=None,
+            weights=None,
+            skipped_reason=str(exc),
+        )
+
+    sequence_matrix = None
+    if temporal_config.enabled:
+        sequence = build_monthly_sequence(tile, temporal_config.target_months)
+        sequence_matrix = gather_eval_sequences(tile_features, sequence)
+
+    return PreparedEvalTile(
+        tile_id=item.tile_id,
+        features=feature_matrix,
+        labels=tile_labels,
+        weights=tile_weights,
+        sequences=sequence_matrix,
+    )
+
+
+def prepare_eval_data(
+    *,
+    metadata: list[TileMetadata],
+    target_years: tuple[int, ...],
+    temporal_config: TemporalConfig,
+    prep_workers: int,
+) -> PreparedEvalData:
+    worker_count = _resolve_prep_workers(prep_workers, len(metadata))
+    LOGGER.info("Preparing %s validation tiles with %s worker(s)", len(metadata), worker_count)
+
+    results: list[PreparedEvalTile]
+    if worker_count == 1:
+        results = [_prepare_eval_tile(item, target_years, temporal_config) for item in metadata]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            results = list(
+                executor.map(
+                    _prepare_eval_tile,
+                    metadata,
+                    repeat(target_years),
+                    repeat(temporal_config),
+                )
+            )
+
+    feature_chunks: list[np.ndarray] = []
+    label_chunks: list[np.ndarray] = []
+    weight_chunks: list[np.ndarray] = []
+    sequence_chunks: list[np.ndarray] = []
+
+    for result in results:
+        if result.skipped_reason is not None:
+            LOGGER.warning("Skipping eval tile %s: %s", result.tile_id, result.skipped_reason)
+            continue
+        if result.features is None or result.labels is None or result.weights is None:
+            raise ValueError(f"Validation tile {result.tile_id} did not return eval arrays.")
+        LOGGER.info("Prepared eval tile %s with %s rows", result.tile_id, result.features.shape[0])
+        feature_chunks.append(result.features)
+        label_chunks.append(result.labels)
+        weight_chunks.append(result.weights)
+        if result.sequences is not None:
+            sequence_chunks.append(result.sequences)
+
+    if not feature_chunks:
+        raise ValueError("No validation tiles produced evaluation pixels.")
+
+    return PreparedEvalData(
+        features=np.concatenate(feature_chunks, axis=0),
+        labels=np.concatenate(label_chunks, axis=0),
+        weights=np.concatenate(weight_chunks, axis=0),
+        sequences=np.concatenate(sequence_chunks, axis=0) if sequence_chunks else None,
+    )
+
+
+def build_train_loader(
+    *,
+    train_data: PreparedTrainData,
+    batch_size: int,
+    num_workers: int,
+    device: torch.device,
+) -> DataLoader:
+    dataset = PixelSampleDataset(
+        np.asarray(train_data.features),
+        np.asarray(train_data.labels),
+        np.asarray(train_data.weights),
+        sequences=(
+            None
+            if train_data.sequences is None
+            else np.asarray(train_data.sequences)
+        ),
+        year_classes=(
+            None
+            if train_data.year_classes is None
+            else np.asarray(train_data.year_classes)
+        ),
+        year_mask=(
+            None
+            if train_data.year_mask is None
+            else np.asarray(train_data.year_mask)
+        ),
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+        drop_last=False,
+        persistent_workers=num_workers > 0,
+    )
+
+
+def _estimate_storage_bytes(array: np.ndarray | torch.Tensor | None) -> int:
+    if array is None:
+        return 0
+    if isinstance(array, torch.Tensor):
+        return int(array.numel() * array.element_size())
+    return int(array.nbytes)
+
+
+def _supports_gpu_resident_data(model_name: str, temporal_config: TemporalConfig) -> bool:
+    return model_name in {"mlp", "resmlp"} and not temporal_config.enabled
+
+
+def should_use_gpu_resident_data(
+    *,
+    mode: str,
+    model_name: str,
+    temporal_config: TemporalConfig,
+    device: torch.device,
+    train_data: PreparedTrainData,
+    val_data: PreparedEvalData,
+) -> bool:
+    if mode == "never" or device.type != "cuda":
+        return False
+
+    if not _supports_gpu_resident_data(model_name, temporal_config):
+        if mode == "always":
+            raise ValueError("GPU-resident data is supported only for non-temporal mlp/resmlp training.")
+        LOGGER.info("GPU-resident data disabled for model=%s temporal=%s", model_name, temporal_config.enabled)
+        return False
+
+    estimated_bytes = (
+        _estimate_storage_bytes(train_data.features)
+        + _estimate_storage_bytes(train_data.labels)
+        + _estimate_storage_bytes(train_data.weights)
+        + _estimate_storage_bytes(train_data.sequences)
+        + _estimate_storage_bytes(train_data.year_classes)
+        + _estimate_storage_bytes(train_data.year_mask)
+        + _estimate_storage_bytes(val_data.features)
+        + _estimate_storage_bytes(val_data.sequences)
+    )
+    total_vram = int(torch.cuda.get_device_properties(device).total_memory)
+    LOGGER.info(
+        "GPU-resident data estimate %.2f GiB / %.2f GiB (mode=%s)",
+        estimated_bytes / 1024**3,
+        total_vram / 1024**3,
+        mode,
+    )
+
+    if mode == "always":
+        if estimated_bytes > int(total_vram * 0.9):
+            raise ValueError(
+                f"GPU-resident data requested but estimated {estimated_bytes / 1024**3:.2f} GiB exceeds 90% of VRAM."
+            )
+        return True
+
+    return estimated_bytes <= total_vram // 2
+
+
+def _to_device_tensor(array: np.ndarray, device: torch.device) -> torch.Tensor:
+    tensor = torch.from_numpy(array)
+    if device.type == "cuda":
+        tensor = tensor.pin_memory()
+    return tensor.to(device=device, non_blocking=device.type == "cuda")
+
+
+def move_train_data_to_device(train_data: PreparedTrainData, device: torch.device) -> PreparedTrainData:
+    return PreparedTrainData(
+        features=_to_device_tensor(np.asarray(train_data.features, dtype=np.float32), device),
+        labels=_to_device_tensor(np.asarray(train_data.labels, dtype=np.float32), device),
+        weights=_to_device_tensor(np.asarray(train_data.weights, dtype=np.float32), device),
+        feature_names=train_data.feature_names,
+        sequences=(
+            None
+            if train_data.sequences is None
+            else _to_device_tensor(np.asarray(train_data.sequences, dtype=np.float32), device)
+        ),
+        year_classes=(
+            None
+            if train_data.year_classes is None
+            else _to_device_tensor(np.asarray(train_data.year_classes, dtype=np.int64), device)
+        ),
+        year_mask=(
+            None
+            if train_data.year_mask is None
+            else _to_device_tensor(np.asarray(train_data.year_mask, dtype=np.float32), device)
+        ),
+        device_resident=True,
+    )
+
+
+def move_eval_data_to_device(eval_data: PreparedEvalData, device: torch.device) -> PreparedEvalData:
+    return PreparedEvalData(
+        features=_to_device_tensor(np.asarray(eval_data.features, dtype=np.float32), device),
+        labels=eval_data.labels,
+        weights=eval_data.weights,
+        sequences=(
+            None
+            if eval_data.sequences is None
+            else _to_device_tensor(np.asarray(eval_data.sequences, dtype=np.float32), device)
+        ),
+        device_resident=True,
+    )
+
+
+def train_one_epoch_resident(
+    *,
+    model: torch.nn.Module,
+    train_data: PreparedTrainData,
+    batch_size: int,
+    optimizer: torch.optim.Optimizer,
+    runtime_config: RuntimeConfig,
+    loss_config: LossConfig,
+    scaler: torch.cuda.amp.GradScaler,
+    temporal_config: TemporalConfig,
+) -> float:
+    if not isinstance(train_data.features, torch.Tensor):
+        raise TypeError("GPU-resident training requires tensor features.")
+
+    model.train()
+    total_loss = torch.zeros((), device=runtime_config.device, dtype=torch.float32)
+    total_weight = torch.zeros((), device=runtime_config.device, dtype=torch.float32)
+    row_count = int(train_data.features.shape[0])
+    order = torch.randperm(row_count, device=runtime_config.device)
+
+    for start in range(0, row_count, batch_size):
+        stop = min(start + batch_size, row_count)
+        index = order[start:stop]
+        features = train_data.features.index_select(0, index)
+        labels = train_data.labels.index_select(0, index)
+        weights = train_data.weights.index_select(0, index)
+        sequence = None if train_data.sequences is None else train_data.sequences.index_select(0, index)
+        year_class = None if train_data.year_classes is None else train_data.year_classes.index_select(0, index)
+        year_mask = None if train_data.year_mask is None else train_data.year_mask.index_select(0, index)
+
+        optimizer.zero_grad(set_to_none=True)
+        with autocast_context(runtime_config):
+            outputs = model(features, sequence=sequence)
+            loss, weighted_loss_sum, weight_sum = compute_total_loss(
+                outputs=outputs,
+                labels=labels,
+                weights=weights,
+                loss_config=loss_config,
+                temporal_config=temporal_config,
+                year_class=year_class,
+                year_mask=year_mask,
+            )
+
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            if runtime_config.grad_clip_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), runtime_config.grad_clip_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if runtime_config.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), runtime_config.grad_clip_norm)
+            optimizer.step()
+
+        total_loss += weighted_loss_sum.detach().float()
+        total_weight += weight_sum.detach().float()
+
+    return float((total_loss / total_weight.clamp_min(1e-6)).cpu())
+
+
+def evaluate_prepared_data(
+    *,
+    model: torch.nn.Module,
+    eval_data: PreparedEvalData,
+    runtime_config: RuntimeConfig,
+    batch_size: int,
+) -> dict[str, np.ndarray]:
+    probabilities = predict_probabilities(
+        model=model,
+        features=eval_data.features,
+        sequences=eval_data.sequences,
+        runtime_config=runtime_config,
+        batch_size=batch_size,
+    )
+    return {
+        "probabilities": probabilities,
+        "labels": eval_data.labels,
+        "weights": eval_data.weights,
+    }
 
 
 def train_one_epoch(
@@ -648,10 +1177,10 @@ def evaluate_on_tiles(
 def predict_probabilities(
     *,
     model: torch.nn.Module,
-    features: np.ndarray,
+    features: np.ndarray | torch.Tensor,
     runtime_config: RuntimeConfig,
     batch_size: int,
-    sequences: np.ndarray | None = None,
+    sequences: np.ndarray | torch.Tensor | None = None,
 ) -> np.ndarray:
     if features.shape[0] == 0:
         return np.empty((0,), dtype=np.float32)
@@ -661,13 +1190,23 @@ def predict_probabilities(
         )
     model.eval()
     outputs: list[np.ndarray] = []
-    with torch.no_grad():
+    with torch.inference_mode():
         for start in range(0, features.shape[0], batch_size):
             stop = min(start + batch_size, features.shape[0])
-            batch_features = torch.from_numpy(features[start:stop]).to(runtime_config.device, non_blocking=True)
+            if isinstance(features, torch.Tensor):
+                batch_features = features[start:stop]
+                if batch_features.device != runtime_config.device:
+                    batch_features = batch_features.to(runtime_config.device, non_blocking=True)
+            else:
+                batch_features = torch.from_numpy(features[start:stop]).to(runtime_config.device, non_blocking=True)
             batch_sequence = None
             if sequences is not None:
-                batch_sequence = torch.from_numpy(sequences[start:stop]).to(runtime_config.device, non_blocking=True)
+                if isinstance(sequences, torch.Tensor):
+                    batch_sequence = sequences[start:stop]
+                    if batch_sequence.device != runtime_config.device:
+                        batch_sequence = batch_sequence.to(runtime_config.device, non_blocking=True)
+                else:
+                    batch_sequence = torch.from_numpy(sequences[start:stop]).to(runtime_config.device, non_blocking=True)
             with autocast_context(runtime_config):
                 model_outputs = model(batch_features, sequence=batch_sequence)
                 probabilities = torch.sigmoid(model_outputs.logits)
@@ -678,8 +1217,8 @@ def predict_probabilities(
 def predict_year_logits(
     *,
     model: torch.nn.Module,
-    features: np.ndarray,
-    sequences: np.ndarray | None,
+    features: np.ndarray | torch.Tensor,
+    sequences: np.ndarray | torch.Tensor | None,
     runtime_config: RuntimeConfig,
     batch_size: int,
 ) -> np.ndarray | None:
@@ -687,13 +1226,23 @@ def predict_year_logits(
         return None
     model.eval()
     outputs: list[np.ndarray] = []
-    with torch.no_grad():
+    with torch.inference_mode():
         for start in range(0, features.shape[0], batch_size):
             stop = min(start + batch_size, features.shape[0])
-            batch_features = torch.from_numpy(features[start:stop]).to(runtime_config.device, non_blocking=True)
+            if isinstance(features, torch.Tensor):
+                batch_features = features[start:stop]
+                if batch_features.device != runtime_config.device:
+                    batch_features = batch_features.to(runtime_config.device, non_blocking=True)
+            else:
+                batch_features = torch.from_numpy(features[start:stop]).to(runtime_config.device, non_blocking=True)
             batch_sequence = None
             if sequences is not None:
-                batch_sequence = torch.from_numpy(sequences[start:stop]).to(runtime_config.device, non_blocking=True)
+                if isinstance(sequences, torch.Tensor):
+                    batch_sequence = sequences[start:stop]
+                    if batch_sequence.device != runtime_config.device:
+                        batch_sequence = batch_sequence.to(runtime_config.device, non_blocking=True)
+                else:
+                    batch_sequence = torch.from_numpy(sequences[start:stop]).to(runtime_config.device, non_blocking=True)
             with autocast_context(runtime_config):
                 model_outputs = model(batch_features, sequence=batch_sequence)
             if model_outputs.year_logits is None:
@@ -709,19 +1258,6 @@ def fit_normalizer(features: np.ndarray) -> Normalizer:
     std = features.std(axis=0, dtype=np.float64).astype(np.float32)
     std[std < 1e-6] = 1.0
     return Normalizer(mean=mean, std=std)
-
-
-def load_hard_negatives(path: Path | None) -> dict[str, np.ndarray]:
-    if path is None:
-        return {}
-    payload = json.loads(path.read_text())
-    tiles = payload.get("tiles", {})
-    LOGGER.info("Loaded hard negatives from %s (%d tiles).", path, len(tiles))
-    return {
-        tile_id: np.asarray(coords, dtype=np.int64).reshape(-1, 2)
-        for tile_id, coords in tiles.items()
-        if coords
-    }
 
 
 def load_normalizer(checkpoint: dict[str, object]) -> Normalizer:

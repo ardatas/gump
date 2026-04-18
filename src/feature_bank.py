@@ -131,6 +131,7 @@ def build_monthly_sequence(
             sequence[time_idx, 8] = np.nan_to_num(desc_value, nan=0.0)
             sequence_mask[time_idx] |= np.isfinite(desc_value) & (desc_value != 0)
 
+    sequence = np.nan_to_num(sequence, nan=0.0)
     return TileSequence(
         sequence=sequence,
         sequence_mask=sequence_mask,
@@ -540,24 +541,29 @@ def compute_persistence_targets(
     labels = raw_labels.astype(np.uint8)
     weights = raw_weights.astype(np.float32).copy()
 
+    strong_consensus = votes >= 2
+    triple_consensus = votes == 3
+    single_source = votes == 1
+
+    refined_positive = (
+        (strong_consensus & (persistence_score >= 0.30))
+        | (triple_consensus & (persistence_score >= 0.15))
+        | (single_source & (persistence_score >= 0.75))
+    )
+    refined_positive &= forest_mask
+
     weights[~forest_mask] = 0.0
 
-    # Use raw consensus labels (≥2 sources agree) as training targets.
-    # Gating by spectral thresholds here creates circular feature-label leakage
-    # and causes the model to fail on non-tropical biomes where NDVI/NBR drop
-    # patterns differ from the training region.  The persistence score is still
-    # present as a feature, so the model can learn to use it as one signal.
-    training_labels = labels.astype(np.uint8)
+    ambiguous_alert = (labels == 1) & ~refined_positive
+    weights[ambiguous_alert] *= 0.15
 
-    # Suppress pixels flagged as positive by only one source AND showing no
-    # spectral signal at all — these are likely labelling artefacts.
-    single_source_no_signal = (votes == 1) & (labels == 0) & (persistence_score < 0.05)
-    weights[single_source_no_signal] *= 0.5
-
-    # Zero-weight likely-unlabelled positives (high spectral drop but no alert):
-    # the model should not learn them as negatives since they may be real events.
     likely_unlabeled_positive = (votes == 0) & forest_mask & (persistence_score >= 0.75)
     weights[likely_unlabeled_positive] = 0.0
+
+    medium_persistence_single_source = single_source & (persistence_score >= 0.45) & (persistence_score < 0.75)
+    weights[medium_persistence_single_source] *= 0.25
+
+    training_labels = refined_positive.astype(np.uint8)
 
     return PersistenceTargets(
         training_labels=training_labels,
@@ -679,33 +685,6 @@ def _normalized_difference(numerator: np.ndarray, denominator: np.ndarray) -> np
     return result
 
 
-def compute_year_heuristic_map(tile: "TileData", target_years: tuple[int, ...]) -> np.ndarray:
-    """Per-pixel alert year from the largest year-over-year NDVI+NBR drop.
-
-    Fallback for time_step prediction when no year-classification head is available.
-    Returns float32 (H, W); pixels with no valid S2 data get the last target year.
-    """
-    height, width = tile.forest_mask.shape
-    last_year = float(target_years[-1]) if target_years else 0.0
-    if len(target_years) < 2:
-        return np.full((height, width), last_year, dtype=np.float32)
-
-    s2 = tile.s2_data / S2_SCALE
-    ndvi = _normalized_difference(s2[:, S2_NIR_INDEX], s2[:, S2_RED_INDEX])
-    nbr = _normalized_difference(s2[:, S2_NIR_INDEX], s2[:, S2_SWIR2_INDEX])
-    ndvi_yearly = _yearly_reduce(ndvi[:, None], tile.s2_year, target_years, reducer="median")[:, 0]
-    nbr_yearly = _yearly_reduce(nbr[:, None], tile.s2_year, target_years, reducer="median")[:, 0]
-
-    yoy_drop = (ndvi_yearly[:-1] - ndvi_yearly[1:]) + (nbr_yearly[:-1] - nbr_yearly[1:])
-    yoy_drop = np.nan_to_num(yoy_drop, nan=-np.inf, posinf=-np.inf, neginf=-np.inf)
-    best_idx = yoy_drop.argmax(axis=0)
-    candidate_years = np.asarray(target_years[1:], dtype=np.float32)
-    year_map = candidate_years[best_idx]
-    no_signal = np.all(~np.isfinite(yoy_drop) | (yoy_drop == -np.inf), axis=0)
-    year_map[no_signal] = last_year
-    return year_map.astype(np.float32)
-
-
 def _reduce_or_zeros(values: np.ndarray, *, reducer: str) -> np.ndarray:
     if values.shape[0] == 0:
         return np.zeros(values.shape[1:], dtype=np.float32)
@@ -750,3 +729,31 @@ def _scaled_score(values: np.ndarray, *, low: float, high: float) -> np.ndarray:
     if high <= low:
         raise ValueError("high must be greater than low")
     return np.clip((values - low) / (high - low), 0.0, 1.0).astype(np.float32)
+
+
+
+def compute_year_heuristic_map(tile: "TileData", target_years: tuple[int, ...]) -> np.ndarray:
+    """Per-pixel alert year from the largest year-over-year NDVI+NBR drop.
+
+    Fallback for time_step prediction when no year-classification head is available.
+    Returns float32 (H, W); pixels with no valid S2 data get the last target year.
+    """
+    height, width = tile.forest_mask.shape
+    last_year = float(target_years[-1]) if target_years else 0.0
+    if len(target_years) < 2:
+        return np.full((height, width), last_year, dtype=np.float32)
+
+    s2 = tile.s2_data / S2_SCALE
+    ndvi = _normalized_difference(s2[:, S2_NIR_INDEX], s2[:, S2_RED_INDEX])
+    nbr = _normalized_difference(s2[:, S2_NIR_INDEX], s2[:, S2_SWIR2_INDEX])
+    ndvi_yearly = _yearly_reduce(ndvi[:, None], tile.s2_year, target_years, reducer="median")[:, 0]
+    nbr_yearly = _yearly_reduce(nbr[:, None], tile.s2_year, target_years, reducer="median")[:, 0]
+
+    yoy_drop = (ndvi_yearly[:-1] - ndvi_yearly[1:]) + (nbr_yearly[:-1] - nbr_yearly[1:])
+    yoy_drop = np.nan_to_num(yoy_drop, nan=-np.inf, posinf=-np.inf, neginf=-np.inf)
+    best_idx = yoy_drop.argmax(axis=0)
+    candidate_years = np.asarray(target_years[1:], dtype=np.float32)
+    year_map = candidate_years[best_idx]
+    no_signal = np.all(~np.isfinite(yoy_drop) | (yoy_drop == -np.inf), axis=0)
+    year_map[no_signal] = last_year
+    return year_map.astype(np.float32)

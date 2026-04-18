@@ -182,9 +182,9 @@ class TestComputePersistenceTargets:
         assert result.training_labels is None
         assert result.training_weights is None
 
-    def test_consensus_labels_used_directly_as_training_labels(self, synthetic_tile):
-        """Training labels must equal raw consensus regardless of spectral signature."""
-        ndvi = self._make_index_yearly(0.7)  # no NDVI drop → no spectral deforestation
+    def test_training_labels_subset_of_consensus(self, synthetic_tile):
+        """Training labels must never be positive where raw consensus is negative."""
+        ndvi = self._make_index_yearly(0.7)
         nbr = self._make_index_yearly(0.6)
         ndmi = self._make_index_yearly(0.4)
         result = compute_persistence_targets(
@@ -197,12 +197,9 @@ class TestComputePersistenceTargets:
             ndmi_yearly=ndmi,
         )
         assert result.training_labels is not None
-        # Labels must match raw consensus even when there is no spectral drop
-        consensus_in_forest = synthetic_tile.label_consensus[synthetic_tile.forest_mask]
-        training_in_forest = result.training_labels[synthetic_tile.forest_mask]
-        assert (training_in_forest == consensus_in_forest).all(), (
-            "Training labels must equal raw consensus labels (biome-agnostic)"
-        )
+        # A pixel that was never flagged by any source cannot become a training positive
+        false_positives = (result.training_labels == 1) & (synthetic_tile.label_consensus == 0)
+        assert not false_positives.any(), "training_labels must be a subset of raw consensus"
 
     def test_out_of_forest_weight_zero(self, synthetic_tile):
         """Pixels outside forest_mask must have weight=0 after refinement."""
