@@ -585,7 +585,7 @@ export default function GumpApp() {
                   />
                   <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text-dim,#94a3b8)', marginTop: 2 }}>
                     <span>{months[0][0]}</span>
-                    {[...new Set(months.map(m => m[0]))].slice(1).map(y => <span key={y}>{y}</span>)}
+                    {Array.from(new Set(months.map(m => m[0]))).slice(1).map(y => <span key={y}>{y}</span>)}
                   </div>
                   {selectedMonth !== null && (
                     <button className="btn-link" style={{ marginTop: 4, fontSize: 11 }}
