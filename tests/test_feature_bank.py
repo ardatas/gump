@@ -182,6 +182,47 @@ class TestComputePersistenceTargets:
         assert result.training_labels is None
         assert result.training_weights is None
 
+    def test_consensus_labels_used_directly_as_training_labels(self, synthetic_tile):
+        """Training labels must equal raw consensus regardless of spectral signature."""
+        ndvi = self._make_index_yearly(0.7)  # no NDVI drop → no spectral deforestation
+        nbr = self._make_index_yearly(0.6)
+        ndmi = self._make_index_yearly(0.4)
+        result = compute_persistence_targets(
+            forest_mask=synthetic_tile.forest_mask,
+            raw_labels=synthetic_tile.label_consensus,
+            raw_weights=synthetic_tile.label_weight,
+            raw_votes=synthetic_tile.label_votes,
+            ndvi_yearly=ndvi,
+            nbr_yearly=nbr,
+            ndmi_yearly=ndmi,
+        )
+        assert result.training_labels is not None
+        # Labels must match raw consensus even when there is no spectral drop
+        consensus_in_forest = synthetic_tile.label_consensus[synthetic_tile.forest_mask]
+        training_in_forest = result.training_labels[synthetic_tile.forest_mask]
+        assert (training_in_forest == consensus_in_forest).all(), (
+            "Training labels must equal raw consensus labels (biome-agnostic)"
+        )
+
+    def test_out_of_forest_weight_zero(self, synthetic_tile):
+        """Pixels outside forest_mask must have weight=0 after refinement."""
+        ndvi = self._make_index_yearly(0.7)
+        nbr = self._make_index_yearly(0.5)
+        ndmi = self._make_index_yearly(0.4)
+        result = compute_persistence_targets(
+            forest_mask=synthetic_tile.forest_mask,
+            raw_labels=synthetic_tile.label_consensus,
+            raw_weights=synthetic_tile.label_weight,
+            raw_votes=synthetic_tile.label_votes,
+            ndvi_yearly=ndvi,
+            nbr_yearly=nbr,
+            ndmi_yearly=ndmi,
+        )
+        assert result.training_weights is not None
+        outside = ~synthetic_tile.forest_mask
+        if outside.any():
+            assert (result.training_weights[outside] == 0.0).all()
+
     def test_large_ndvi_drop_raises_persistence_score(self, synthetic_tile):
         """A large NDVI drop (0.9 → 0.1) should produce high persistence score."""
         ndvi_high = np.full((1, H, W), 0.9, dtype=np.float32)
