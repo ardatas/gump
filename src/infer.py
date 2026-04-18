@@ -17,14 +17,9 @@ from .dataset import (
     scatter_predictions,
 )
 from .feature_bank import (
-    S2_NIR_INDEX,
-    S2_RED_INDEX,
-    S2_SCALE,
-    S2_SWIR2_INDEX,
-    _normalized_difference,
-    _yearly_reduce,
     build_monthly_sequence,
     build_tile_features,
+    compute_year_heuristic_map,
 )
 from .models import load_model_from_checkpoint
 from .postprocess import PostprocessConfig, postprocess_probability_map
@@ -73,9 +68,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-probabilities", action="store_true")
     parser.add_argument("--closing-radius", type=int, default=2)
     parser.add_argument("--opening-radius", type=int, default=1)
-    parser.add_argument("--min-area-ha", type=float, default=1.0)
+    parser.add_argument("--min-area-ha", type=float, default=0.5)
     parser.add_argument("--min-hole-area-ha", type=float, default=0.5)
-    parser.add_argument("--persistence-threshold", type=float, default=0.3)
+    parser.add_argument("--persistence-threshold", type=float, default=0.0)
     parser.add_argument("--predict-time-step", action="store_true",
                         help="Fill the time_step GeoJSON field. Uses the alert_year head if present in any checkpoint; "
                              "otherwise falls back to a per-pixel NDVI/NBR drop heuristic.")
@@ -276,34 +271,6 @@ def load_checkpoint_bundle(path: Path, device: torch.device) -> CheckpointBundle
         num_year_classes=num_year_classes,
         feature_names=feature_names,
     )
-
-
-def compute_year_heuristic_map(tile, target_years: tuple[int, ...]) -> np.ndarray:
-    """Per-pixel alert year from the largest year-over-year NDVI+NBR drop.
-
-    Used when no year-classification checkpoint is available. Returns a (H, W)
-    float map; pixels with no S2 signal or only a single target year get the
-    last target year as a safe default.
-    """
-    height, width = tile.forest_mask.shape
-    last_year = float(target_years[-1]) if target_years else 0.0
-    if len(target_years) < 2:
-        return np.full((height, width), last_year, dtype=np.float32)
-
-    s2 = tile.s2_data / S2_SCALE
-    ndvi = _normalized_difference(s2[:, S2_NIR_INDEX], s2[:, S2_RED_INDEX])
-    nbr = _normalized_difference(s2[:, S2_NIR_INDEX], s2[:, S2_SWIR2_INDEX])
-    ndvi_yearly = _yearly_reduce(ndvi[:, None], tile.s2_year, target_years, reducer="median")[:, 0]
-    nbr_yearly = _yearly_reduce(nbr[:, None], tile.s2_year, target_years, reducer="median")[:, 0]
-
-    yoy_drop = (ndvi_yearly[:-1] - ndvi_yearly[1:]) + (nbr_yearly[:-1] - nbr_yearly[1:])
-    yoy_drop = np.nan_to_num(yoy_drop, nan=-np.inf, posinf=-np.inf, neginf=-np.inf)
-    best_idx = yoy_drop.argmax(axis=0)
-    candidate_years = np.asarray(target_years[1:], dtype=np.float32)
-    year_map = candidate_years[best_idx]
-    no_signal = np.all(~np.isfinite(yoy_drop) | (yoy_drop == -np.inf), axis=0)
-    year_map[no_signal] = last_year
-    return year_map.astype(np.float32)
 
 
 def _load_per_region_thresholds(path: Path | None) -> dict[str, float]:

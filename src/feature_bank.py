@@ -679,6 +679,33 @@ def _normalized_difference(numerator: np.ndarray, denominator: np.ndarray) -> np
     return result
 
 
+def compute_year_heuristic_map(tile: "TileData", target_years: tuple[int, ...]) -> np.ndarray:
+    """Per-pixel alert year from the largest year-over-year NDVI+NBR drop.
+
+    Fallback for time_step prediction when no year-classification head is available.
+    Returns float32 (H, W); pixels with no valid S2 data get the last target year.
+    """
+    height, width = tile.forest_mask.shape
+    last_year = float(target_years[-1]) if target_years else 0.0
+    if len(target_years) < 2:
+        return np.full((height, width), last_year, dtype=np.float32)
+
+    s2 = tile.s2_data / S2_SCALE
+    ndvi = _normalized_difference(s2[:, S2_NIR_INDEX], s2[:, S2_RED_INDEX])
+    nbr = _normalized_difference(s2[:, S2_NIR_INDEX], s2[:, S2_SWIR2_INDEX])
+    ndvi_yearly = _yearly_reduce(ndvi[:, None], tile.s2_year, target_years, reducer="median")[:, 0]
+    nbr_yearly = _yearly_reduce(nbr[:, None], tile.s2_year, target_years, reducer="median")[:, 0]
+
+    yoy_drop = (ndvi_yearly[:-1] - ndvi_yearly[1:]) + (nbr_yearly[:-1] - nbr_yearly[1:])
+    yoy_drop = np.nan_to_num(yoy_drop, nan=-np.inf, posinf=-np.inf, neginf=-np.inf)
+    best_idx = yoy_drop.argmax(axis=0)
+    candidate_years = np.asarray(target_years[1:], dtype=np.float32)
+    year_map = candidate_years[best_idx]
+    no_signal = np.all(~np.isfinite(yoy_drop) | (yoy_drop == -np.inf), axis=0)
+    year_map[no_signal] = last_year
+    return year_map.astype(np.float32)
+
+
 def _reduce_or_zeros(values: np.ndarray, *, reducer: str) -> np.ndarray:
     if values.shape[0] == 0:
         return np.zeros(values.shape[1:], dtype=np.float32)

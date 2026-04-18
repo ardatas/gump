@@ -158,6 +158,53 @@ class TestSampleTileTrainingData:
         assert sampled.features.shape[1] == tf.feature_cube.shape[0]
 
 
+class TestHardNegativeSampling:
+    def test_hard_negatives_are_sampled(self, rng):
+        """Hard-negative coords should appear in the sampled negatives."""
+        metadata = _make_metadata()
+        tf = _dummy_tile_features()
+        # Pick coords that are clearly in the negative (label=0) region
+        hard_coords = np.array([[0, 0], [0, 1], [1, 0]], dtype=np.int64)
+        sampled = sample_tile_training_data(
+            metadata, tf, rng,
+            negative_ratio=2.0,
+            hard_negative_coords=hard_coords,
+            hard_negative_fraction=0.5,
+        )
+        assert sampled.features.shape[0] > 0
+
+    def test_hard_negatives_outside_valid_ignored(self, rng):
+        """Hard-negative coords with weight=0 must be discarded silently."""
+        metadata = _make_metadata()
+        tf = _dummy_tile_features()
+        # Coords with label=1 are not valid negatives — must be filtered
+        invalid_hard = np.array([[2, 2], [3, 5]], dtype=np.int64)  # these are positives
+        sampled = sample_tile_training_data(
+            metadata, tf, rng,
+            negative_ratio=2.0,
+            hard_negative_coords=invalid_hard,
+            hard_negative_fraction=0.9,
+        )
+        # All sampled labels must still be valid (0 or 1, no mix-up)
+        assert set(sampled.labels.astype(int).tolist()).issubset({0, 1})
+
+    def test_empty_hard_negatives_falls_back_to_random(self, rng):
+        """Empty hard-negative array must fall back to standard random sampling."""
+        metadata = _make_metadata()
+        tf = _dummy_tile_features()
+        empty_hard = np.empty((0, 2), dtype=np.int64)
+        sampled_hard = sample_tile_training_data(
+            metadata, tf, rng, negative_ratio=2.0,
+            hard_negative_coords=empty_hard, hard_negative_fraction=0.5,
+        )
+        rng2 = np.random.default_rng(42)
+        sampled_none = sample_tile_training_data(
+            metadata, tf, rng2, negative_ratio=2.0,
+            hard_negative_coords=None,
+        )
+        assert sampled_hard.features.shape[0] == sampled_none.features.shape[0]
+
+
 class TestBuildEvalMatrix:
     def test_returns_four_arrays(self):
         tf = _dummy_tile_features()

@@ -19,6 +19,7 @@ from src.train import (
     normalize_features,
     predict_probabilities,
 )
+from src.feature_bank import compute_year_heuristic_map
 from tests.conftest import TARGET_YEARS, H, W, _make_metadata, _make_tile
 
 
@@ -218,3 +219,38 @@ class TestTrainingPipeline:
             scheduler.step()
         # LR must decrease from start to end
         assert lrs[-1] < lrs[0], f"LR did not decrease: {lrs[0]:.6f} → {lrs[-1]:.6f}"
+
+
+class TestYearHeuristicMap:
+    def test_output_shape(self, rng):
+        tile = _make_tile(rng)
+        year_map = compute_year_heuristic_map(tile, TARGET_YEARS)
+        assert year_map.shape == (H, W)
+
+    def test_output_dtype_float32(self, rng):
+        tile = _make_tile(rng)
+        year_map = compute_year_heuristic_map(tile, TARGET_YEARS)
+        assert year_map.dtype == np.float32
+
+    def test_years_are_valid_target_years(self, rng):
+        """Every assigned year must be one of the target years (not an interpolation)."""
+        tile = _make_tile(rng)
+        year_map = compute_year_heuristic_map(tile, TARGET_YEARS)
+        unique_years = set(year_map.flatten().tolist())
+        assert unique_years.issubset({float(y) for y in TARGET_YEARS})
+
+    def test_single_year_returns_constant_map(self, rng):
+        """With only one target year, all pixels get that year as default."""
+        tile = _make_tile(rng)
+        year_map = compute_year_heuristic_map(tile, (2021,))
+        assert (year_map == 2021.0).all()
+
+    def test_large_nir_drop_year2_returns_year2(self, rng):
+        """If NIR drops sharply in year 2, heuristic should assign year 2021."""
+        tile = _make_tile(rng)
+        # Make year-2021 observations (indices 6-11) have very low NIR
+        tile.s2_data[6:, 7] = 200.0   # NIR collapses in 2021
+        tile.s2_data[:6, 7] = 7000.0  # NIR high in 2020
+        year_map = compute_year_heuristic_map(tile, TARGET_YEARS)
+        # Majority of pixels should be assigned 2021
+        assert (year_map == 2021.0).mean() > 0.5
