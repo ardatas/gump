@@ -80,6 +80,8 @@ def sample_tile_training_data(
     sequence: TileSequence | None = None,
     year_min: int | None = None,
     num_year_classes: int = 0,
+    hard_negative_coords: np.ndarray | None = None,
+    hard_negative_fraction: float = 0.5,
 ) -> TileTrainingSamples:
     """Sample training pixels from a single tile.
 
@@ -113,7 +115,16 @@ def sample_tile_training_data(
     else:
         target_negatives = min(neg_coords.shape[0], negatives_if_no_positive)
 
-    sampled_negatives = _sample_rows(neg_coords, target_negatives, rng)
+    if hard_negative_coords is not None and hard_negative_coords.size > 0 and target_negatives > 0:
+        hard_valid = negative_mask[hard_negative_coords[:, 0], hard_negative_coords[:, 1]]
+        valid_hard = hard_negative_coords[hard_valid]
+        n_hard_target = min(valid_hard.shape[0], int(round(target_negatives * hard_negative_fraction)))
+        sampled_hard = _sample_rows(valid_hard, n_hard_target, rng) if n_hard_target > 0 else np.empty((0, 2), dtype=int)
+        random_target = target_negatives - sampled_hard.shape[0]
+        sampled_random = _sample_rows(neg_coords, random_target, rng)
+        sampled_negatives = np.concatenate([sampled_hard, sampled_random], axis=0) if sampled_hard.shape[0] > 0 else sampled_random
+    else:
+        sampled_negatives = _sample_rows(neg_coords, target_negatives, rng)
     all_coords = np.concatenate([sampled_positives, sampled_negatives], axis=0)
     if all_coords.size == 0:
         raise ValueError(f"Tile {metadata.tile_id} produced no sampled pixels.")

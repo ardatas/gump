@@ -545,22 +545,22 @@ def compute_persistence_targets(
     single_source = votes == 1
 
     refined_positive = (
-        (strong_consensus & (persistence_score >= 0.30))
-        | (triple_consensus & (persistence_score >= 0.15))
-        | (single_source & (persistence_score >= 0.75))
+        (strong_consensus & (persistence_score >= 0.20))
+        | (triple_consensus)
+        | (single_source & (persistence_score >= 0.55))
     )
     refined_positive &= forest_mask
 
     weights[~forest_mask] = 0.0
 
     ambiguous_alert = (labels == 1) & ~refined_positive
-    weights[ambiguous_alert] *= 0.15
+    weights[ambiguous_alert] *= 0.35
 
-    likely_unlabeled_positive = (votes == 0) & forest_mask & (persistence_score >= 0.75)
+    likely_unlabeled_positive = (votes == 0) & forest_mask & (persistence_score >= 0.80)
     weights[likely_unlabeled_positive] = 0.0
 
-    medium_persistence_single_source = single_source & (persistence_score >= 0.45) & (persistence_score < 0.75)
-    weights[medium_persistence_single_source] *= 0.25
+    medium_persistence_single_source = single_source & (persistence_score >= 0.35) & (persistence_score < 0.55)
+    weights[medium_persistence_single_source] *= 0.5
 
     training_labels = refined_positive.astype(np.uint8)
 

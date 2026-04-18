@@ -76,13 +76,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--min-learning-rate", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--negative-ratio", type=float, default=3.0)
+    parser.add_argument("--negative-ratio", type=float, default=1.5)
     parser.add_argument("--max-samples-per-tile", type=int, default=500_000)
     parser.add_argument("--val-region", action="append", dest="val_regions", default=[])
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--log-level", default="INFO")
-    parser.add_argument("--model-name", choices=["mlp", "resmlp", "tcnn"], default="resmlp")
+    parser.add_argument("--model-name", choices=["mlp", "resmlp", "tcnn"], default="tcnn")
     parser.add_argument("--hidden-dims", nargs="+", type=int, default=[512, 512, 256, 256, 128])
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--loss", choices=["bce", "focal", "gce"], default="focal")
@@ -95,7 +95,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--early-stopping-patience", type=int, default=0)
     parser.add_argument("--use-temporal", action="store_true", help="Build monthly sequences (auto when --model-name=tcnn).")
-    parser.add_argument("--aux-year-loss-weight", type=float, default=0.0, help="Multi-task weight for year classification head.")
+    parser.add_argument("--aux-year-loss-weight", type=float, default=0.3, help="Multi-task weight for year classification head.")
+    parser.add_argument("--hard-negatives-json", type=Path, default=None,
+                        help="Optional JSON from src.mine_hard_negatives: injects FPs as preferred negatives.")
+    parser.add_argument("--hard-negative-fraction", type=float, default=0.5,
+                        help="Fraction of the negative budget per tile filled from the hard-negatives cache.")
     parser.add_argument("--resume", type=Path)
     return parser.parse_args()
 
@@ -142,6 +146,7 @@ def main() -> None:
     )
 
     rng = np.random.default_rng(args.seed)
+    hard_negatives_map = load_hard_negatives(args.hard_negatives_json)
     train_feature_chunks: list[np.ndarray] = []
     train_label_chunks: list[np.ndarray] = []
     train_weight_chunks: list[np.ndarray] = []
@@ -156,6 +161,7 @@ def main() -> None:
         tile_features = build_tile_features(tile, target_years)
         feature_names = tile_features.feature_names
         sequence = build_monthly_sequence(tile, target_months) if use_temporal else None
+        hard_negatives_for_tile = hard_negatives_map.get(item.tile_id) if hard_negatives_map else None
         try:
             sampled = sample_tile_training_data(
                 item,
@@ -166,6 +172,8 @@ def main() -> None:
                 sequence=sequence,
                 year_min=temporal_config.year_min,
                 num_year_classes=temporal_config.num_year_classes,
+                hard_negative_coords=hard_negatives_for_tile,
+                hard_negative_fraction=args.hard_negative_fraction,
             )
         except ValueError as exc:
             LOGGER.warning("Skipping train tile %s: %s", item.tile_id, exc)
@@ -701,6 +709,19 @@ def fit_normalizer(features: np.ndarray) -> Normalizer:
     std = features.std(axis=0, dtype=np.float64).astype(np.float32)
     std[std < 1e-6] = 1.0
     return Normalizer(mean=mean, std=std)
+
+
+def load_hard_negatives(path: Path | None) -> dict[str, np.ndarray]:
+    if path is None:
+        return {}
+    payload = json.loads(path.read_text())
+    tiles = payload.get("tiles", {})
+    LOGGER.info("Loaded hard negatives from %s (%d tiles).", path, len(tiles))
+    return {
+        tile_id: np.asarray(coords, dtype=np.int64).reshape(-1, 2)
+        for tile_id, coords in tiles.items()
+        if coords
+    }
 
 
 def load_normalizer(checkpoint: dict[str, object]) -> Normalizer:

@@ -16,7 +16,16 @@ from .dataset import (
     gather_prediction_sequences,
     scatter_predictions,
 )
-from .feature_bank import build_monthly_sequence, build_tile_features
+from .feature_bank import (
+    S2_NIR_INDEX,
+    S2_RED_INDEX,
+    S2_SCALE,
+    S2_SWIR2_INDEX,
+    _normalized_difference,
+    _yearly_reduce,
+    build_monthly_sequence,
+    build_tile_features,
+)
 from .models import load_model_from_checkpoint
 from .postprocess import PostprocessConfig, postprocess_probability_map
 from .train import (
@@ -58,14 +67,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--amp-dtype", choices=["none", "bf16", "fp16"], default="bf16")
     parser.add_argument("--threshold-override", type=float)
+    parser.add_argument("--threshold-offset", type=float, default=0.0,
+                        help="Added to the checkpoint threshold (negative values lower it, catching more positives).")
     parser.add_argument("--per-region-thresholds", type=Path, help="Optional JSON mapping region -> threshold.")
     parser.add_argument("--save-probabilities", action="store_true")
-    parser.add_argument("--closing-radius", type=int, default=1)
+    parser.add_argument("--closing-radius", type=int, default=2)
     parser.add_argument("--opening-radius", type=int, default=1)
-    parser.add_argument("--min-area-ha", type=float, default=0.5)
-    parser.add_argument("--min-hole-area-ha", type=float, default=0.0)
-    parser.add_argument("--persistence-threshold", type=float, default=0.0)
-    parser.add_argument("--predict-time-step", action="store_true", help="Use the alert_year head (if present) to fill the time_step GeoJSON field.")
+    parser.add_argument("--min-area-ha", type=float, default=1.0)
+    parser.add_argument("--min-hole-area-ha", type=float, default=0.5)
+    parser.add_argument("--persistence-threshold", type=float, default=0.3)
+    parser.add_argument("--predict-time-step", action="store_true",
+                        help="Fill the time_step GeoJSON field. Uses the alert_year head if present in any checkpoint; "
+                             "otherwise falls back to a per-pixel NDVI/NBR drop heuristic.")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -103,6 +116,7 @@ def main() -> None:
         if args.threshold_override is not None
         else float(np.mean([bundle.threshold for bundle in bundles]))
     )
+    base_threshold = float(np.clip(base_threshold + args.threshold_offset, 0.0, 1.0))
 
     raster_dir = args.output_root / "rasters"
     geojson_dir = args.output_root / "geojson"
@@ -113,6 +127,9 @@ def main() -> None:
         probability_dir.mkdir(parents=True, exist_ok=True)
 
     year_bundle = next((bundle for bundle in bundles if bundle.num_year_classes > 0), None)
+    heuristic_year_fallback = args.predict_time_step and year_bundle is None and len(target_years) >= 2
+    if args.predict_time_step and year_bundle is None and not heuristic_year_fallback:
+        LOGGER.warning("--predict-time-step requested but no year head present and <2 target years; time_step will be empty.")
 
     for tile_path in list_tile_paths(args.cache_root, args.split):
         tile = load_tile_data(tile_path)
@@ -184,6 +201,8 @@ def main() -> None:
                     fill_value=np.nan,
                     dtype=np.float32,
                 )
+        elif heuristic_year_fallback:
+            time_step_map = compute_year_heuristic_map(tile, target_years)
 
         geojson_path = geojson_dir / f"{tile.metadata.tile_id}.geojson"
         if prediction.any():
@@ -219,7 +238,12 @@ def main() -> None:
                     "min_hole_area_ha": max(0.0, args.min_hole_area_ha),
                     "persistence_threshold": max(0.0, args.persistence_threshold),
                 },
-                "predict_time_step": args.predict_time_step and year_bundle is not None,
+                "predict_time_step": args.predict_time_step and (year_bundle is not None or heuristic_year_fallback),
+                "time_step_source": (
+                    "year_head" if (args.predict_time_step and year_bundle is not None)
+                    else ("ndvi_nbr_heuristic" if heuristic_year_fallback else "none")
+                ),
+                "threshold_offset": float(args.threshold_offset),
             },
             indent=2,
         )
@@ -252,6 +276,34 @@ def load_checkpoint_bundle(path: Path, device: torch.device) -> CheckpointBundle
         num_year_classes=num_year_classes,
         feature_names=feature_names,
     )
+
+
+def compute_year_heuristic_map(tile, target_years: tuple[int, ...]) -> np.ndarray:
+    """Per-pixel alert year from the largest year-over-year NDVI+NBR drop.
+
+    Used when no year-classification checkpoint is available. Returns a (H, W)
+    float map; pixels with no S2 signal or only a single target year get the
+    last target year as a safe default.
+    """
+    height, width = tile.forest_mask.shape
+    last_year = float(target_years[-1]) if target_years else 0.0
+    if len(target_years) < 2:
+        return np.full((height, width), last_year, dtype=np.float32)
+
+    s2 = tile.s2_data / S2_SCALE
+    ndvi = _normalized_difference(s2[:, S2_NIR_INDEX], s2[:, S2_RED_INDEX])
+    nbr = _normalized_difference(s2[:, S2_NIR_INDEX], s2[:, S2_SWIR2_INDEX])
+    ndvi_yearly = _yearly_reduce(ndvi[:, None], tile.s2_year, target_years, reducer="median")[:, 0]
+    nbr_yearly = _yearly_reduce(nbr[:, None], tile.s2_year, target_years, reducer="median")[:, 0]
+
+    yoy_drop = (ndvi_yearly[:-1] - ndvi_yearly[1:]) + (nbr_yearly[:-1] - nbr_yearly[1:])
+    yoy_drop = np.nan_to_num(yoy_drop, nan=-np.inf, posinf=-np.inf, neginf=-np.inf)
+    best_idx = yoy_drop.argmax(axis=0)
+    candidate_years = np.asarray(target_years[1:], dtype=np.float32)
+    year_map = candidate_years[best_idx]
+    no_signal = np.all(~np.isfinite(yoy_drop) | (yoy_drop == -np.inf), axis=0)
+    year_map[no_signal] = last_year
+    return year_map.astype(np.float32)
 
 
 def _load_per_region_thresholds(path: Path | None) -> dict[str, float]:
