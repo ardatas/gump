@@ -1,0 +1,9 @@
+data_root: /workspace/data
+cache_root: /workspace/cache
+workers: 20
+s1_clip_db: [-30.0, 0.0]
+s1_epsilon_linear: 1.0e-6
+dtype: float16
+resampling:
+  continuous: bilinear
+  discrete: nearest

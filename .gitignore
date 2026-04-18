@@ -3,7 +3,12 @@ __pycache__/
 .ipynb_checkpoints/
 .DS_Store
 .venv/
+.claude/
 venv/
 data/
 !www/public/data/
 !www/public/data/**
+runs/
+submission/
+*.npy
+*.npz

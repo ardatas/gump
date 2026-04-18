@@ -1,0 +1,12 @@
+cache_root: /workspace/cache
+labels_root: /workspace/data/labels
+workers: 16
+
+# Forest mask thresholds (PLAN_B §5)
+ndvi_threshold: 0.6
+ndwi_threshold: 0.0
+
+# Label harmonization (PLAN_B §4)
+# w_single: weight for pixels with only 1 source positive
+# Ablation values: 0.0 (ignore single-source), 0.3 (default), 0.5 (moderate)
+w_single: 0.3
