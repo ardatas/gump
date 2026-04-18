@@ -107,6 +107,29 @@ def build_eval_matrix(tile_features: TileFeatures) -> tuple[np.ndarray, np.ndarr
     return features, labels, weights, eval_mask
 
 
+def build_prediction_matrix(
+    tile_features: TileFeatures,
+    mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    prediction_mask = tile_features.forest_mask if mask is None else mask.astype(bool)
+    rows, cols = np.nonzero(prediction_mask)
+    features = tile_features.feature_cube[:, rows, cols].T.astype(np.float32)
+    return features, prediction_mask
+
+
+def scatter_predictions(
+    values: np.ndarray,
+    mask: np.ndarray,
+    *,
+    fill_value: float = 0.0,
+    dtype: np.dtype = np.float32,
+) -> np.ndarray:
+    output = np.full(mask.shape, fill_value, dtype=dtype)
+    rows, cols = np.nonzero(mask)
+    output[rows, cols] = values.astype(dtype, copy=False)
+    return output
+
+
 def _sample_rows(array: np.ndarray, count: int, rng: np.random.Generator) -> np.ndarray:
     if count <= 0 or array.shape[0] == 0:
         return np.empty((0, array.shape[1] if array.ndim == 2 else 0), dtype=array.dtype)

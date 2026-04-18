@@ -22,6 +22,8 @@ class TileFeatures:
     forest_mask: np.ndarray
     labels: np.ndarray | None
     weights: np.ndarray | None
+    persistence_score: np.ndarray
+    persistence_mask: np.ndarray
 
 
 def build_tile_features(tile: TileData, target_years: tuple[int, ...]) -> TileFeatures:
@@ -63,6 +65,16 @@ def build_tile_features(tile: TileData, target_years: tuple[int, ...]) -> TileFe
     aef_mean = _safe_nanmean(aef_yearly, axis=0)
     aef_delta = aef_yearly[-1] - aef_yearly[0]
 
+    persistence = compute_persistence_targets(
+        forest_mask=tile.forest_mask,
+        raw_labels=tile.label_consensus,
+        raw_weights=tile.label_weight,
+        raw_votes=tile.label_votes,
+        ndvi_yearly=ndvi_yearly[:, 0],
+        nbr_yearly=nbr_yearly[:, 0],
+        ndmi_yearly=ndmi_yearly[:, 0],
+    )
+
     feature_arrays = [
         s2_yearly.reshape(-1, *tile.forest_mask.shape),
         s2_delta,
@@ -76,6 +88,7 @@ def build_tile_features(tile: TileData, target_years: tuple[int, ...]) -> TileFe
         s1_std,
         aef_mean,
         aef_delta,
+        persistence.feature_layers,
     ]
     feature_cube = np.concatenate(feature_arrays, axis=0).astype(np.float32)
     feature_cube = np.nan_to_num(feature_cube, nan=0.0, posinf=0.0, neginf=0.0)
@@ -92,14 +105,137 @@ def build_tile_features(tile: TileData, target_years: tuple[int, ...]) -> TileFe
         + ("s1_asc_delta", "s1_desc_delta", "s1_asc_std", "s1_desc_std")
         + tuple(f"aef_mean_{index:02d}" for index in range(64))
         + tuple(f"aef_delta_{index:02d}" for index in range(64))
+        + (
+            "recent_ndvi",
+            "recent_nbr",
+            "recent_ndmi",
+            "ndvi_drop",
+            "nbr_drop",
+            "ndmi_drop",
+            "persistence_score",
+            "persistence_mask",
+        )
     )
 
     return TileFeatures(
         feature_cube=feature_cube,
         feature_names=feature_names,
         forest_mask=tile.forest_mask,
-        labels=tile.label_consensus,
-        weights=tile.label_weight,
+        labels=persistence.training_labels,
+        weights=persistence.training_weights,
+        persistence_score=persistence.persistence_score,
+        persistence_mask=persistence.persistence_mask,
+    )
+
+
+@dataclass(frozen=True)
+class PersistenceTargets:
+    training_labels: np.ndarray | None
+    training_weights: np.ndarray | None
+    persistence_score: np.ndarray
+    persistence_mask: np.ndarray
+    feature_layers: np.ndarray
+
+
+def compute_persistence_targets(
+    *,
+    forest_mask: np.ndarray,
+    raw_labels: np.ndarray | None,
+    raw_weights: np.ndarray | None,
+    raw_votes: np.ndarray | None,
+    ndvi_yearly: np.ndarray,
+    nbr_yearly: np.ndarray,
+    ndmi_yearly: np.ndarray,
+) -> PersistenceTargets:
+    recent_years = min(2, ndvi_yearly.shape[0])
+    recent_ndvi = _safe_nanmean(ndvi_yearly[-recent_years:], axis=0)
+    recent_nbr = _safe_nanmean(nbr_yearly[-recent_years:], axis=0)
+    recent_ndmi = _safe_nanmean(ndmi_yearly[-recent_years:], axis=0)
+
+    baseline_ndvi = ndvi_yearly[0]
+    baseline_nbr = nbr_yearly[0]
+    baseline_ndmi = ndmi_yearly[0]
+
+    ndvi_drop = baseline_ndvi - recent_ndvi
+    nbr_drop = baseline_nbr - recent_nbr
+    ndmi_drop = baseline_ndmi - recent_ndmi
+
+    drop_score = (
+        0.45 * _scaled_score(ndvi_drop, low=0.10, high=0.35)
+        + 0.40 * _scaled_score(nbr_drop, low=0.05, high=0.30)
+        + 0.15 * _scaled_score(ndmi_drop, low=0.05, high=0.25)
+    )
+    state_score = (
+        0.5 * _scaled_score(0.60 - recent_ndvi, low=0.05, high=0.30)
+        + 0.3 * _scaled_score(0.45 - recent_nbr, low=0.05, high=0.25)
+        + 0.2 * _scaled_score(0.35 - recent_ndmi, low=0.02, high=0.18)
+    )
+    persistence_score = np.clip(0.6 * drop_score + 0.4 * state_score, 0.0, 1.0).astype(np.float32)
+    persistence_mask = (
+        forest_mask
+        & (ndvi_drop >= 0.18)
+        & (nbr_drop >= 0.10)
+        & (recent_ndvi <= 0.60)
+        & (persistence_score >= 0.45)
+    )
+
+    feature_layers = np.stack(
+        [
+            recent_ndvi.astype(np.float32),
+            recent_nbr.astype(np.float32),
+            recent_ndmi.astype(np.float32),
+            ndvi_drop.astype(np.float32),
+            nbr_drop.astype(np.float32),
+            ndmi_drop.astype(np.float32),
+            persistence_score.astype(np.float32),
+            persistence_mask.astype(np.float32),
+        ],
+        axis=0,
+    )
+
+    if raw_labels is None or raw_weights is None or raw_votes is None:
+        return PersistenceTargets(
+            training_labels=None,
+            training_weights=None,
+            persistence_score=persistence_score,
+            persistence_mask=persistence_mask,
+            feature_layers=feature_layers,
+        )
+
+    votes = raw_votes.astype(np.uint8)
+    labels = raw_labels.astype(np.uint8)
+    weights = raw_weights.astype(np.float32).copy()
+
+    strong_consensus = votes >= 2
+    triple_consensus = votes == 3
+    single_source = votes == 1
+
+    refined_positive = (
+        (strong_consensus & (persistence_score >= 0.30))
+        | (triple_consensus & (persistence_score >= 0.15))
+        | (single_source & (persistence_score >= 0.75))
+    )
+    refined_positive &= forest_mask
+
+    weights[~forest_mask] = 0.0
+
+    ambiguous_alert = (labels == 1) & ~refined_positive
+    weights[ambiguous_alert] *= 0.15
+
+    likely_unlabeled_positive = (votes == 0) & forest_mask & (persistence_score >= 0.75)
+    weights[likely_unlabeled_positive] = 0.0
+
+    medium_persistence_single_source = single_source & (persistence_score >= 0.45) & (persistence_score < 0.75)
+    weights[medium_persistence_single_source] *= 0.25
+
+    training_labels = refined_positive.astype(np.uint8)
+
+    return PersistenceTargets(
+        training_labels=training_labels,
+        training_weights=weights,
+        persistence_score=persistence_score,
+        persistence_mask=persistence_mask,
+        feature_layers=feature_layers,
     )
 
 
@@ -185,3 +321,9 @@ def _safe_nanstd(values: np.ndarray, axis: int = 0, keepdims: bool = False) -> n
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         return np.nanstd(values, axis=axis, keepdims=keepdims)
+
+
+def _scaled_score(values: np.ndarray, *, low: float, high: float) -> np.ndarray:
+    if high <= low:
+        raise ValueError("high must be greater than low")
+    return np.clip((values - low) / (high - low), 0.0, 1.0).astype(np.float32)
