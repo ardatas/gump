@@ -180,7 +180,7 @@ export default function GumpApp() {
       tiles.satellite.addTo(map)
       ;(map as unknown as Record<string, unknown>)._basemapLayers = tiles
 
-      const legend = L.control({ position: 'bottomright' })
+      const legend = (L.control as unknown as (opts: object) => L.Control)({ position: 'bottomright' })
       legend.onAdd = () => {
         const div = L.DomUtil.create('div', 'legend')
         let html = '<div class="title">Jahr der Deforestation</div>'
