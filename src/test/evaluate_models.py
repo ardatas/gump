@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
+import yaml
 
 import numpy as np
 import rasterio
@@ -23,9 +24,11 @@ LOGGER = logging.getLogger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate multiple models from a runs directory on the test set using IoU.")
-    parser.add_argument("--runs-dir", type=Path, required=True, help="Directory containing run folders (e.g. /workspace/runs/gump)")
-    parser.add_argument("--cache-root", type=Path, required=True, help="Path to tile cache directory")
-    parser.add_argument("--output", type=Path, required=True, help="Output JSON report file")
+    parser.add_argument("--runs-dir", type=Path, help="Override directory containing run folders")
+    parser.add_argument("--train-config", type=Path, default=Path("configs/training.yaml"), help="Path to training config to read runs_dir from")
+    parser.add_argument("--config", type=Path, default=Path("configs/preprocess.yaml"), help="Path to preprocessing config to read cache_root from")
+    parser.add_argument("--cache-root", type=Path, help="Override cache root path")
+    parser.add_argument("--output-dir", type=Path, default=Path("/workspace/evaluation"), help="Directory to save evaluation results")
     parser.add_argument("--split", choices=["train", "test"], default="test", help="Dataset split to evaluate on")
     parser.add_argument("--eval-batch-size", type=int, default=131072)
     parser.add_argument("--device", default="cuda")
@@ -52,15 +55,39 @@ def main() -> None:
         grad_clip_norm=0.0,
     )
 
+    if args.cache_root:
+        cache_root = args.cache_root
+    else:
+        if not args.config.exists():
+            raise SystemExit(f"Configuration file {args.config} not found and --cache-root not provided.")
+        with open(args.config, "r") as f:
+            config_data = yaml.safe_load(f)
+            if "cache_root" not in config_data:
+                raise SystemExit(f"'cache_root' key missing in {args.config}")
+            cache_root = Path(config_data["cache_root"])
+            LOGGER.info("Loaded cache_root=%s from %s", cache_root, args.config)
+
+    if args.runs_dir:
+        runs_dir = args.runs_dir
+    else:
+        if not args.train_config.exists():
+            raise SystemExit(f"Configuration file {args.train_config} not found and --runs-dir not provided.")
+        with open(args.train_config, "r") as f:
+            train_config_data = yaml.safe_load(f)
+            if "runs_dir" not in train_config_data:
+                raise SystemExit(f"'runs_dir' key missing in {args.train_config}")
+            runs_dir = Path(train_config_data["runs_dir"])
+            LOGGER.info("Loaded runs_dir=%s from %s", runs_dir, args.train_config)
+
     # Find all best checkpoints
-    checkpoints = list(args.runs_dir.rglob("best.pt"))
+    checkpoints = list(runs_dir.rglob("best.pt"))
     if not checkpoints:
-        LOGGER.error("No best.pt checkpoints found in %s", args.runs_dir)
+        LOGGER.error("No best.pt checkpoints found in %s", runs_dir)
         return
 
-    tile_paths = list_tile_paths(args.cache_root, args.split)
+    tile_paths = list_tile_paths(cache_root, args.split)
     if not tile_paths:
-        raise SystemExit(f"No evaluation tiles found for split '{args.split}' in {args.cache_root}.")
+        raise SystemExit(f"No evaluation tiles found for split '{args.split}' in {cache_root}.")
 
     results = []
 
@@ -162,13 +189,14 @@ def main() -> None:
     # Sort results by unweighted IoU descending
     results.sort(key=lambda r: r["metrics"]["unweighted_iou"], reverse=True)
     
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps({
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = args.output_dir / "test_results.json"
+    report_path.write_text(json.dumps({
         "split": args.split,
         "results": results
     }, indent=2))
     
-    LOGGER.info("Evaluation complete. Results saved to %s", args.output)
+    LOGGER.info("Evaluation complete. Results saved to %s", report_path)
     
     print("\n" + "=" * 85)
     print(f"{'Model':<30} | {'u-IoU':<8} | {'w-IoU':<8} | {'F1':<8} | {'Prec':<8} | {'Rec':<8}")
