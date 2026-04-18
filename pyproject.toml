@@ -1,9 +1,17 @@
 [project]
 name = "gump"
 version = "0.1.0"
-description = "Add your description here"
+description = "Utilities and training pipeline for the osapiens deforestation challenge"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.10"
 dependencies = [
     "boto3>=1.42.91",
+    "geopandas>=1.0.0",
+    "numpy>=1.26.4",
+    "pandas>=2.2.2",
+    "rasterio>=1.4.3",
+    "shapely>=2.0.3",
+    "tqdm>=4.66",
+    "zarr>=2.18,<3",
+    "numcodecs>=0.13",
 ]
