@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker exec rocm *)",
+      "Bash(docker exec *)",
+      "Bash(git -C /shared-docker status)",
+      "Bash(git -C /shared-docker remote -v)",
+      "Bash(git -C /shared-docker log --oneline -5)",
+      "Bash(git -C /shared-docker fetch origin)",
+      "Bash(git -C /shared-docker log --oneline origin/main ^HEAD)"
+    ]
+  }
+}
