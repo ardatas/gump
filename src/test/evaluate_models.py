@@ -9,6 +9,7 @@ import yaml
 import numpy as np
 import rasterio
 import torch
+from tqdm import tqdm
 
 from src.cache import list_tile_paths, load_tile_data, load_tile_metadata
 from src.dataset import build_prediction_matrix, gather_prediction_sequences, scatter_predictions
@@ -85,25 +86,24 @@ def main() -> None:
         LOGGER.error("No best.pt checkpoints found in %s", runs_dir)
         return
 
-    # Discover tile paths by checking the Zarr metadata directly
-    tile_paths = []
-    for path in cache_root.iterdir():
-        if path.is_dir() and not path.name.startswith("."):
-            try:
-                metadata = load_tile_metadata(path)
-                if metadata.split == args.split:
-                    tile_paths.append(path)
-            except Exception as e:
-                pass # skip directories that are not valid zarr tiles
+    # Check if 'gump' subdirectory exists in cache, as the pipeline creates them there
+    if (cache_root / "gump").exists():
+        actual_cache_root = cache_root / "gump"
+    else:
+        actual_cache_root = cache_root
+
+    tile_paths = list_tile_paths(actual_cache_root, args.split)
 
     if not tile_paths:
-        raise SystemExit(f"No evaluation tiles found for split '{args.split}' in {cache_root}.")
+        raise SystemExit(f"No evaluation tiles found for split '{args.split}' in {actual_cache_root}.")
 
     results = []
 
-    for ckpt_path in checkpoints:
+    LOGGER.info("Starting evaluation for %d models on %d test tiles.", len(checkpoints), len(tile_paths))
+
+    for ckpt_path in tqdm(checkpoints, desc="Evaluating Models", position=0):
         model_name = ckpt_path.parent.name
-        LOGGER.info("Evaluating model: %s", model_name)
+        # LOGGER.info("Evaluating model: %s", model_name) # Using tqdm desc instead
         
         payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         model = load_model_from_checkpoint(payload).to(device)
@@ -131,7 +131,7 @@ def main() -> None:
         predictions_list: list[np.ndarray] = []
         weights_list: list[np.ndarray] = []
 
-        for tile_path in tile_paths:
+        for tile_path in tqdm(tile_paths, desc=f"Tiles ({model_name})", leave=False, position=1):
             tile = load_tile_data(tile_path)
             tile_features = build_tile_features(tile, target_years)
             if tile_features.labels is None or tile_features.weights is None:
@@ -184,12 +184,8 @@ def main() -> None:
             "metrics": metrics,
         })
         
-        LOGGER.info(
-            "Model %s: u-IoU=%.4f (w-IoU=%.4f), F1=%.4f",
-            model_name,
-            metrics["unweighted_iou"],
-            metrics["iou"],
-            metrics["f1"],
+        tqdm.write(
+            f"Model {model_name}: u-IoU={metrics['unweighted_iou']:.4f} (w-IoU={metrics['iou']:.4f}), F1={metrics['f1']:.4f}"
         )
 
     if not results:
