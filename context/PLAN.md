@@ -72,11 +72,38 @@ Alles Pro-Tile in **eine kompakte Form** bringen, die der Dataloader direkt mmap
 - Warum: der Dataloader zieht später nur noch Patches aus mmap-en Arrays, kein Rasterio-Overhead im Hot-Loop. Auf MI300X sonst I/O-bound.
 - Normalisierungs-Stats (Mean/Std pro Band) einmalig auf Train berechnen und als `.json` speichern.
 
-### 3.3 Forest-Mask 2020 (wichtig!)
-Definition: "Deforestation nur, wenn Area 2020 Wald war." Zwei pragmatische Optionen:
-1. **Quick:** Threshold auf S2-2020 NDVI-Median (NDVI > ~0.6 & nicht-Wasser). Schnell, leicht zu verifizieren.
-2. **Besser:** Hansen Global Forest Cover 2020 (treecover2020 ≥ 30 %) falls wir Zeit finden, extern zu ziehen.
-Starten mit NDVI-Median. Forest-Mask wird **im Post-Processing** auf Predictions angewandt: alles außerhalb 2020-Forest → 0.
+### 3.3 Forest-Mask 2020 — Hansen GFC (implementiert)
+
+**Status:** ✅ `src/data/forest_mask.py` + `src/patch_forest_masks.py` fertig. Alle Zarr-Caches gepatcht.
+
+**Definition:**
+```
+forest_2020 = (Hansen treecover2000 ≥ 30 %) AND (lossyear == 0)
+```
+- `treecover2000`: Baumbedeckung im Jahr 2000 (0–100 %, 30 m → reprojiziert auf 10 m UTM-Grid)
+- `lossyear == 0`: kein aufgezeichneter Waldverlust zwischen 2001 und 2020 (Hansen GFC v1.8 geht bis Jahr 20 = 2020)
+
+**Warum nicht NDVI-Threshold:**
+
+| | NDVI-Threshold (alt) | Hansen GFC (neu) |
+|---|---|---|
+| Datenquelle | Sentinel-2 — **dieselben Bänder die als Features ins Modell gehen** | Unabhängige externe Referenz |
+| Kreiszirkularität | Modell sieht Forest-Mask-Signal doppelt (NDVI als Feature + als Mask-Basis) | Keine — orthogonale Quelle |
+| Falsch-Positiv-Risiko | Savanne, Crops, Buschland mit NDVI > 0.6 landet in der Maske | Nur struktureller Wald (≥ 30 % Kronenschluss) |
+| Temporal-Logik | 2020-Median kann bereits leicht degradierte Pixel als Wald sehen | `lossyear == 0` = exakt kein Verlust bis Ende 2020 |
+| Industriestandard | Projektinterner Proxy | Offizieller GFW-Standard, den Jury kennt |
+
+**Konkreter Mehrwert im System:**
+
+1. **Negatives werden zuverlässiger.** Alle Negatives (label=0) werden aus `forest_2020 == True`-Pixeln gezogen. Mit NDVI-Mask landen Savanne/Crops als Negatives im Training — das Modell lernt "nicht-Wald → kein Alarm", nicht "Wald → kein Alarm".
+
+2. **Kein Signal-Leakage.** NDVI und NBR-Drop sind unsere stärksten Delta-Features. Wenn die Forest-Mask aus demselben NDVI berechnet wird, maskiert sie genau die Pixel raus, auf denen das Modell seinen stärksten Signal-Drop sehen würde — self-defeating.
+
+3. **Harter Post-Processing-Filter.** `prediction &= forest_2020_mask` in `postprocess.py` schneidet False Positives auf Stadträndern, Agrarland, Wasserflächen ab — unabhängig vom Modell-Score.
+
+4. **persistence_score / Label-Refinement nutzt die Maske.** `compute_persistence_targets()` in `feature_bank.py` berechnet `refined_positive &= forest_mask` — d.h. die Label-Qualitäts-Schicht baut direkt auf der Mask-Qualität auf.
+
+**Laufzeit:** Download via `/vsicurl/` (kein Full-Download), ~5–10 s pro Tile. Patch-Script überschreibt nur `forest_2020` in bestehenden Zarr-Stores — kein Re-Warping von S2/S1/AEF nötig.
 
 ### 3.4 Label-Harmonisierung (B's Kern-Aufgabe)
 Alle drei Quellen werden zu zwei Rastern pro Tile reduziert:

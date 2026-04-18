@@ -5,7 +5,6 @@ import math
 
 import numpy as np
 from rasterio import Affine
-from skimage.morphology import binary_closing, binary_opening, disk, remove_small_holes, remove_small_objects
 
 
 @dataclass(frozen=True)
@@ -26,6 +25,14 @@ def postprocess_probability_map(
     config: PostprocessConfig,
     persistence_score: np.ndarray | None = None,
 ) -> np.ndarray:
+    from skimage.morphology import (  # lazy import — skimage not needed at import time
+        binary_closing,
+        binary_opening,
+        disk,
+        remove_small_holes,
+        remove_small_objects,
+    )
+
     prediction = probability_map >= config.threshold
     prediction &= forest_mask
 

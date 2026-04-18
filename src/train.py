@@ -14,10 +14,20 @@ import torch
 from torch.utils.data import DataLoader
 
 from .cache import TileMetadata, choose_validation_regions, discover_target_years, list_tile_paths, load_tile_data, load_tile_metadata
-from .dataset import PixelSampleDataset, build_eval_matrix, sample_tile_training_data
-from .feature_bank import build_tile_features
+from .dataset import (
+    PixelSampleDataset,
+    build_eval_matrix,
+    gather_eval_sequences,
+    sample_tile_training_data,
+)
+from .feature_bank import (
+    SEQUENCE_CHANNELS,
+    build_monthly_sequence,
+    build_target_months,
+    build_tile_features,
+)
 from .metrics import find_best_threshold, weighted_average_precision
-from .models import build_model, load_model_from_checkpoint
+from .models import ModelOutputs, build_model, load_model_from_checkpoint
 
 
 LOGGER = logging.getLogger(__name__)
@@ -34,6 +44,8 @@ class LossConfig:
     name: str
     focal_gamma: float
     positive_class_weight: float | None
+    gce_q: float
+    label_smoothing: float
 
 
 @dataclass(frozen=True)
@@ -41,6 +53,16 @@ class RuntimeConfig:
     device: torch.device
     amp_dtype: torch.dtype | None
     grad_clip_norm: float
+
+
+@dataclass(frozen=True)
+class TemporalConfig:
+    enabled: bool
+    target_months: tuple[tuple[int, int], ...]
+    channels: tuple[str, ...]
+    year_min: int | None
+    num_year_classes: int
+    aux_year_loss_weight: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,22 +76,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--min-learning-rate", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--negative-ratio", type=float, default=3.0)
+    parser.add_argument("--negative-ratio", type=float, default=1.5)
     parser.add_argument("--max-samples-per-tile", type=int, default=500_000)
     parser.add_argument("--val-region", action="append", dest="val_regions", default=[])
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--log-level", default="INFO")
-    parser.add_argument("--model-name", choices=["mlp", "resmlp"], default="resmlp")
+    parser.add_argument("--model-name", choices=["mlp", "resmlp", "tcnn"], default="tcnn")
     parser.add_argument("--hidden-dims", nargs="+", type=int, default=[512, 512, 256, 256, 128])
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--loss", choices=["bce", "focal"], default="focal")
+    parser.add_argument("--loss", choices=["bce", "focal", "gce"], default="focal")
     parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument("--gce-q", type=float, default=0.7)
+    parser.add_argument("--label-smoothing", type=float, default=0.0)
     parser.add_argument("--positive-class-weight", type=float, default=0.0)
     parser.add_argument("--auto-positive-class-weight", action="store_true")
     parser.add_argument("--amp-dtype", choices=["none", "bf16", "fp16"], default="bf16")
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--early-stopping-patience", type=int, default=0)
+    parser.add_argument("--use-temporal", action="store_true", help="Build monthly sequences (auto when --model-name=tcnn).")
+    parser.add_argument("--aux-year-loss-weight", type=float, default=0.3, help="Multi-task weight for year classification head.")
+    parser.add_argument("--hard-negatives-json", type=Path, default=None,
+                        help="Optional JSON from src.mine_hard_negatives: injects FPs as preferred negatives.")
+    parser.add_argument("--hard-negative-fraction", type=float, default=0.5,
+                        help="Fraction of the negative budget per tile filled from the hard-negatives cache.")
     parser.add_argument("--resume", type=Path)
     return parser.parse_args()
 
@@ -99,10 +129,30 @@ def main() -> None:
     LOGGER.info("Train tiles: %s", [item.tile_id for item in train_metadata])
     LOGGER.info("Val tiles: %s", [item.tile_id for item in val_metadata])
 
+    use_temporal = args.use_temporal or args.model_name == "tcnn"
+    target_months = build_target_months(target_years) if use_temporal else ()
+    sequence_length = len(target_months)
+    sequence_channels = len(SEQUENCE_CHANNELS) if use_temporal else 0
+
+    year_min = min(target_years) if target_years else None
+    num_year_classes = (max(target_years) - min(target_years) + 1) if (target_years and args.aux_year_loss_weight > 0) else 0
+    temporal_config = TemporalConfig(
+        enabled=use_temporal,
+        target_months=target_months,
+        channels=SEQUENCE_CHANNELS if use_temporal else (),
+        year_min=year_min,
+        num_year_classes=num_year_classes,
+        aux_year_loss_weight=float(args.aux_year_loss_weight),
+    )
+
     rng = np.random.default_rng(args.seed)
+    hard_negatives_map = load_hard_negatives(args.hard_negatives_json)
     train_feature_chunks: list[np.ndarray] = []
     train_label_chunks: list[np.ndarray] = []
     train_weight_chunks: list[np.ndarray] = []
+    train_sequence_chunks: list[np.ndarray] = []
+    train_year_class_chunks: list[np.ndarray] = []
+    train_year_mask_chunks: list[np.ndarray] = []
     feature_names: tuple[str, ...] | None = None
 
     for item in train_metadata:
@@ -110,6 +160,8 @@ def main() -> None:
         tile = load_tile_data(item.path)
         tile_features = build_tile_features(tile, target_years)
         feature_names = tile_features.feature_names
+        sequence = build_monthly_sequence(tile, target_months) if use_temporal else None
+        hard_negatives_for_tile = hard_negatives_map.get(item.tile_id) if hard_negatives_map else None
         try:
             sampled = sample_tile_training_data(
                 item,
@@ -117,6 +169,11 @@ def main() -> None:
                 rng,
                 negative_ratio=args.negative_ratio,
                 max_samples_per_tile=args.max_samples_per_tile,
+                sequence=sequence,
+                year_min=temporal_config.year_min,
+                num_year_classes=temporal_config.num_year_classes,
+                hard_negative_coords=hard_negatives_for_tile,
+                hard_negative_fraction=args.hard_negative_fraction,
             )
         except ValueError as exc:
             LOGGER.warning("Skipping train tile %s: %s", item.tile_id, exc)
@@ -131,6 +188,11 @@ def main() -> None:
         train_feature_chunks.append(sampled.features)
         train_label_chunks.append(sampled.labels)
         train_weight_chunks.append(sampled.weights)
+        if sampled.sequences is not None:
+            train_sequence_chunks.append(sampled.sequences)
+        if sampled.year_classes is not None and sampled.year_mask is not None:
+            train_year_class_chunks.append(sampled.year_classes)
+            train_year_mask_chunks.append(sampled.year_mask)
 
     if feature_names is None:
         raise SystemExit("No features were built for training.")
@@ -140,6 +202,9 @@ def main() -> None:
     raw_train_features = np.concatenate(train_feature_chunks, axis=0)
     train_labels = np.concatenate(train_label_chunks, axis=0)
     train_weights = np.concatenate(train_weight_chunks, axis=0)
+    train_sequences = np.concatenate(train_sequence_chunks, axis=0) if train_sequence_chunks else None
+    train_year_classes = np.concatenate(train_year_class_chunks, axis=0) if train_year_class_chunks else None
+    train_year_mask = np.concatenate(train_year_mask_chunks, axis=0) if train_year_mask_chunks else None
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     amp_dtype = resolve_amp_dtype(args.amp_dtype, device)
@@ -163,6 +228,8 @@ def main() -> None:
         name=args.loss,
         focal_gamma=args.focal_gamma,
         positive_class_weight=positive_class_weight,
+        gce_q=float(args.gce_q),
+        label_smoothing=float(args.label_smoothing),
     )
 
     if checkpoint is None:
@@ -171,7 +238,14 @@ def main() -> None:
         normalizer = load_normalizer(checkpoint)
     train_features = normalize_features(raw_train_features, normalizer)
 
-    dataset = PixelSampleDataset(train_features, train_labels, train_weights)
+    dataset = PixelSampleDataset(
+        train_features,
+        train_labels,
+        train_weights,
+        sequences=train_sequences,
+        year_classes=train_year_classes,
+        year_mask=train_year_mask,
+    )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -188,6 +262,9 @@ def main() -> None:
             input_dim=train_features.shape[1],
             hidden_dims=args.hidden_dims,
             dropout=args.dropout,
+            sequence_channels=sequence_channels,
+            sequence_length=sequence_length,
+            num_year_classes=num_year_classes,
         ).to(device)
     else:
         model = load_model_from_checkpoint(checkpoint).to(device)
@@ -231,6 +308,7 @@ def main() -> None:
         val_metadata=val_metadata,
         feature_names=feature_names,
         positive_class_weight=positive_class_weight,
+        temporal_config=temporal_config,
     )
 
     epochs_without_improvement = 0
@@ -242,6 +320,7 @@ def main() -> None:
             runtime_config=runtime_config,
             loss_config=loss_config,
             scaler=scaler,
+            temporal_config=temporal_config,
         )
         scheduler.step()
 
@@ -252,6 +331,7 @@ def main() -> None:
             normalizer=normalizer,
             runtime_config=runtime_config,
             batch_size=args.eval_batch_size,
+            temporal_config=temporal_config,
         )
         threshold, threshold_metrics = find_best_threshold(
             val_result["probabilities"],
@@ -307,6 +387,7 @@ def main() -> None:
             best_f1=checkpoint_best_f1,
             best_threshold=checkpoint_best_threshold,
             history=history,
+            temporal_config=temporal_config,
         )
 
         if improved:
@@ -330,6 +411,7 @@ def main() -> None:
                 best_f1=best_f1,
                 best_threshold=best_threshold,
                 history=history,
+                temporal_config=temporal_config,
             )
         else:
             epochs_without_improvement += 1
@@ -360,24 +442,36 @@ def train_one_epoch(
     runtime_config: RuntimeConfig,
     loss_config: LossConfig,
     scaler: torch.cuda.amp.GradScaler,
+    temporal_config: TemporalConfig,
 ) -> float:
     model.train()
     total_loss = 0.0
     total_weight = 0.0
 
-    for features, labels, weights in loader:
-        features = features.to(runtime_config.device, non_blocking=True)
-        labels = labels.to(runtime_config.device, non_blocking=True)
-        weights = weights.to(runtime_config.device, non_blocking=True)
+    for batch in loader:
+        features = batch["features"].to(runtime_config.device, non_blocking=True)
+        labels = batch["labels"].to(runtime_config.device, non_blocking=True)
+        weights = batch["weights"].to(runtime_config.device, non_blocking=True)
+        sequence = batch.get("sequence")
+        if sequence is not None:
+            sequence = sequence.to(runtime_config.device, non_blocking=True)
+        year_class = batch.get("year_class")
+        year_mask = batch.get("year_mask")
+        if year_class is not None and year_mask is not None:
+            year_class = year_class.to(runtime_config.device, non_blocking=True)
+            year_mask = year_mask.to(runtime_config.device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
         with autocast_context(runtime_config):
-            logits = model(features)
-            loss, weighted_loss_sum, weight_sum = compute_weighted_loss(
-                logits=logits,
+            outputs = model(features, sequence=sequence)
+            loss, weighted_loss_sum, weight_sum = compute_total_loss(
+                outputs=outputs,
                 labels=labels,
                 weights=weights,
                 loss_config=loss_config,
+                temporal_config=temporal_config,
+                year_class=year_class,
+                year_mask=year_mask,
             )
 
         if scaler.is_enabled():
@@ -399,6 +493,43 @@ def train_one_epoch(
     return total_loss / max(total_weight, 1e-6)
 
 
+def compute_total_loss(
+    *,
+    outputs: ModelOutputs,
+    labels: torch.Tensor,
+    weights: torch.Tensor,
+    loss_config: LossConfig,
+    temporal_config: TemporalConfig,
+    year_class: torch.Tensor | None,
+    year_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    binary_loss, weighted_loss_sum, weight_sum = compute_weighted_loss(
+        logits=outputs.logits,
+        labels=labels,
+        weights=weights,
+        loss_config=loss_config,
+    )
+    loss = binary_loss
+
+    if (
+        temporal_config.aux_year_loss_weight > 0.0
+        and outputs.year_logits is not None
+        and year_class is not None
+        and year_mask is not None
+    ):
+        per_pixel_year_loss = torch.nn.functional.cross_entropy(
+            outputs.year_logits,
+            year_class,
+            reduction="none",
+        )
+        masked_year_sum = (per_pixel_year_loss * year_mask).sum()
+        masked_year_weight = year_mask.sum().clamp_min(1e-6)
+        year_loss = masked_year_sum / masked_year_weight
+        loss = loss + temporal_config.aux_year_loss_weight * year_loss
+
+    return loss, weighted_loss_sum, weight_sum
+
+
 def compute_weighted_loss(
     *,
     logits: torch.Tensor,
@@ -406,31 +537,63 @@ def compute_weighted_loss(
     weights: torch.Tensor,
     loss_config: LossConfig,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    pos_weight = None
-    if loss_config.positive_class_weight is not None:
-        pos_weight = torch.tensor(
-            loss_config.positive_class_weight,
-            device=logits.device,
-            dtype=logits.dtype,
+    smoothed_labels = labels
+    if loss_config.label_smoothing > 0:
+        eps = loss_config.label_smoothing
+        smoothed_labels = labels * (1.0 - eps) + 0.5 * eps
+
+    if loss_config.name == "gce":
+        loss_per_item = _generalized_cross_entropy(logits, smoothed_labels, q=loss_config.gce_q)
+        if loss_config.positive_class_weight is not None:
+            multiplier = torch.where(
+                labels > 0.5,
+                torch.full_like(loss_per_item, loss_config.positive_class_weight),
+                torch.ones_like(loss_per_item),
+            )
+            loss_per_item = loss_per_item * multiplier
+    else:
+        pos_weight = None
+        if loss_config.positive_class_weight is not None:
+            pos_weight = torch.tensor(
+                loss_config.positive_class_weight,
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+        loss_per_item = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits,
+            smoothed_labels,
+            reduction="none",
+            pos_weight=pos_weight,
         )
-
-    loss_per_item = torch.nn.functional.binary_cross_entropy_with_logits(
-        logits,
-        labels,
-        reduction="none",
-        pos_weight=pos_weight,
-    )
-
-    if loss_config.name == "focal":
-        probabilities = torch.sigmoid(logits)
-        pt = torch.where(labels > 0.5, probabilities, 1.0 - probabilities)
-        focal_factor = (1.0 - pt).pow(loss_config.focal_gamma)
-        loss_per_item = loss_per_item * focal_factor
+        if loss_config.name == "focal":
+            probabilities = torch.sigmoid(logits)
+            pt = torch.where(labels > 0.5, probabilities, 1.0 - probabilities)
+            focal_factor = (1.0 - pt).pow(loss_config.focal_gamma)
+            loss_per_item = loss_per_item * focal_factor
 
     weighted_loss_sum = (loss_per_item * weights).sum()
     weight_sum = weights.sum().clamp_min(1e-6)
     loss = weighted_loss_sum / weight_sum
     return loss, weighted_loss_sum, weight_sum
+
+
+def _generalized_cross_entropy(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    q: float,
+) -> torch.Tensor:
+    """GCE loss for binary classification, robust to label noise.
+
+    Reference: Zhang & Sabuncu (2018), "Generalized Cross Entropy Loss for
+    Training Deep Neural Networks with Noisy Labels".
+    """
+    if not 0.0 < q <= 1.0:
+        raise ValueError(f"GCE q must lie in (0, 1]; got {q}")
+    probabilities = torch.sigmoid(logits)
+    p_target = labels * probabilities + (1.0 - labels) * (1.0 - probabilities)
+    p_target = p_target.clamp(min=1e-6, max=1.0)
+    return (1.0 - p_target.pow(q)) / q
 
 
 def evaluate_on_tiles(
@@ -441,6 +604,7 @@ def evaluate_on_tiles(
     normalizer: Normalizer,
     runtime_config: RuntimeConfig,
     batch_size: int,
+    temporal_config: TemporalConfig,
 ) -> dict[str, np.ndarray]:
     probabilities: list[np.ndarray] = []
     labels: list[np.ndarray] = []
@@ -456,9 +620,14 @@ def evaluate_on_tiles(
             LOGGER.warning("Skipping eval tile %s: %s", item.tile_id, exc)
             continue
         feature_matrix = normalize_features(feature_matrix, normalizer)
+        sequence_matrix = None
+        if temporal_config.enabled:
+            sequence = build_monthly_sequence(tile, temporal_config.target_months)
+            sequence_matrix = gather_eval_sequences(tile_features, sequence)
         tile_probabilities = predict_probabilities(
             model=model,
             features=feature_matrix,
+            sequences=sequence_matrix,
             runtime_config=runtime_config,
             batch_size=batch_size,
         )
@@ -482,18 +651,56 @@ def predict_probabilities(
     features: np.ndarray,
     runtime_config: RuntimeConfig,
     batch_size: int,
+    sequences: np.ndarray | None = None,
 ) -> np.ndarray:
     if features.shape[0] == 0:
         return np.empty((0,), dtype=np.float32)
+    if sequences is not None and sequences.shape[0] != features.shape[0]:
+        raise ValueError(
+            f"sequences and features must share the first dim; got {sequences.shape[0]} vs {features.shape[0]}."
+        )
     model.eval()
     outputs: list[np.ndarray] = []
     with torch.no_grad():
         for start in range(0, features.shape[0], batch_size):
             stop = min(start + batch_size, features.shape[0])
-            batch = torch.from_numpy(features[start:stop]).to(runtime_config.device, non_blocking=True)
+            batch_features = torch.from_numpy(features[start:stop]).to(runtime_config.device, non_blocking=True)
+            batch_sequence = None
+            if sequences is not None:
+                batch_sequence = torch.from_numpy(sequences[start:stop]).to(runtime_config.device, non_blocking=True)
             with autocast_context(runtime_config):
-                probabilities = torch.sigmoid(model(batch))
-            outputs.append(probabilities.detach().cpu().numpy().astype(np.float32))
+                model_outputs = model(batch_features, sequence=batch_sequence)
+                probabilities = torch.sigmoid(model_outputs.logits)
+            outputs.append(probabilities.detach().float().cpu().numpy())
+    return np.concatenate(outputs, axis=0)
+
+
+def predict_year_logits(
+    *,
+    model: torch.nn.Module,
+    features: np.ndarray,
+    sequences: np.ndarray | None,
+    runtime_config: RuntimeConfig,
+    batch_size: int,
+) -> np.ndarray | None:
+    if features.shape[0] == 0:
+        return None
+    model.eval()
+    outputs: list[np.ndarray] = []
+    with torch.no_grad():
+        for start in range(0, features.shape[0], batch_size):
+            stop = min(start + batch_size, features.shape[0])
+            batch_features = torch.from_numpy(features[start:stop]).to(runtime_config.device, non_blocking=True)
+            batch_sequence = None
+            if sequences is not None:
+                batch_sequence = torch.from_numpy(sequences[start:stop]).to(runtime_config.device, non_blocking=True)
+            with autocast_context(runtime_config):
+                model_outputs = model(batch_features, sequence=batch_sequence)
+            if model_outputs.year_logits is None:
+                return None
+            outputs.append(model_outputs.year_logits.detach().cpu().float().numpy())
+    if not outputs:
+        return None
     return np.concatenate(outputs, axis=0)
 
 
@@ -502,6 +709,19 @@ def fit_normalizer(features: np.ndarray) -> Normalizer:
     std = features.std(axis=0, dtype=np.float64).astype(np.float32)
     std[std < 1e-6] = 1.0
     return Normalizer(mean=mean, std=std)
+
+
+def load_hard_negatives(path: Path | None) -> dict[str, np.ndarray]:
+    if path is None:
+        return {}
+    payload = json.loads(path.read_text())
+    tiles = payload.get("tiles", {})
+    LOGGER.info("Loaded hard negatives from %s (%d tiles).", path, len(tiles))
+    return {
+        tile_id: np.asarray(coords, dtype=np.int64).reshape(-1, 2)
+        for tile_id, coords in tiles.items()
+        if coords
+    }
 
 
 def load_normalizer(checkpoint: dict[str, object]) -> Normalizer:
@@ -525,6 +745,7 @@ def write_run_config(
     val_metadata: list[TileMetadata],
     feature_names: tuple[str, ...],
     positive_class_weight: float | None,
+    temporal_config: TemporalConfig,
 ) -> None:
     (run_dir / "config.json").write_text(
         json.dumps(
@@ -536,6 +757,14 @@ def write_run_config(
                 "val_tiles": [item.tile_id for item in val_metadata],
                 "feature_names": list(feature_names),
                 "positive_class_weight": positive_class_weight,
+                "temporal": {
+                    "enabled": temporal_config.enabled,
+                    "channels": list(temporal_config.channels),
+                    "sequence_length": len(temporal_config.target_months),
+                    "year_min": temporal_config.year_min,
+                    "num_year_classes": temporal_config.num_year_classes,
+                    "aux_year_loss_weight": temporal_config.aux_year_loss_weight,
+                },
             },
             indent=2,
         )
@@ -560,6 +789,7 @@ def save_checkpoint(
     best_f1: float,
     best_threshold: float,
     history: list[dict[str, float]],
+    temporal_config: TemporalConfig,
 ) -> None:
     torch.save(
         {
@@ -585,6 +815,13 @@ def save_checkpoint(
             "epoch": epoch,
             "history": history,
             "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
+            "sequence_channels": len(temporal_config.channels),
+            "sequence_length": len(temporal_config.target_months),
+            "target_months": [list(month) for month in temporal_config.target_months],
+            "sequence_channel_names": list(temporal_config.channels),
+            "year_min": temporal_config.year_min,
+            "num_year_classes": temporal_config.num_year_classes,
+            "aux_year_loss_weight": temporal_config.aux_year_loss_weight,
         },
         path,
     )

@@ -16,4 +16,6 @@ dependencies = [
     "tqdm>=4.66",
     "zarr>=2.18,<3",
     "numcodecs>=0.13",
+    "filelock>=3.13",
+    "pyproj>=3.6",
 ]

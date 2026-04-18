@@ -23,10 +23,45 @@ import rasterio
 import yaml
 from rasterio.enums import Resampling
 
+from src.data.forest_mask import get_or_build_forest_mask   # --- NEU ---
 from src.data.io import aef_paths, list_tiles, s1_paths, s2_paths
 from src.data.reproject import open_reference_grid, read_on_grid
 
 logger = logging.getLogger(__name__)
+
+
+def _area(p: Path) -> int:
+    with rasterio.open(p) as s:
+        return s.height * s.width
+
+
+# --- NEU ---
+def extract_tile_meta(tile_id: str, raw_data_dir: Path, split: str = "train") -> dict:
+    """Return ``{crs, transform, shape}`` from the first available S2 TIFF.
+
+    Args:
+        tile_id: Tile name, e.g. ``"18NWH_1_4"``.
+        raw_data_dir: Root of the raw data tree (contains ``sentinel-2/``).
+        split: ``"train"`` or ``"test"`` — tried in that order if the first fails.
+
+    Returns:
+        Dict with keys ``"crs"`` (rasterio CRS), ``"transform"`` (Affine),
+        ``"shape"`` (tuple[int, int] of H × W).
+
+    Raises:
+        RuntimeError: If no S2 files are found for ``tile_id``.
+    """
+    s2_list = s2_paths(raw_data_dir, tile_id, split)
+    if not s2_list:
+        other_split = "test" if split == "train" else "train"
+        s2_list = s2_paths(raw_data_dir, tile_id, other_split)
+    if not s2_list:
+        raise RuntimeError(f"No S2 files found for tile {tile_id!r} in {raw_data_dir}")
+
+    # Use the largest frame as reference (same logic as prepare_tile)
+    ref_path = max((p for _, p in s2_list), key=lambda p: _area(p))
+    transform, crs, H, W = open_reference_grid(ref_path)
+    return {"crs": crs, "transform": transform, "shape": (H, W)}
 
 
 def _write_meta(
@@ -143,10 +178,6 @@ def prepare_tile(
 
     # Pick the S2 frame with the largest HxW as reference. Some tiles have a
     # truncated first month (e.g. 6x4) alongside full-size later frames.
-    def _area(p: Path) -> int:
-        with rasterio.open(p) as s:
-            return s.height * s.width
-
     ref_path = max((p for _, p in s2_list), key=_area)
     transform, crs, H, W = open_reference_grid(ref_path)
 
@@ -161,11 +192,23 @@ def prepare_tile(
     )
     aef, has_nan_aef = _stack_aef(aef_list, transform, crs, H, W)
 
+    # --- NEU: Hansen GFC forest mask ---
+    tile_meta = {"crs": crs, "transform": transform, "shape": (H, W)}
+    hansen_cache = Path(cfg.get("hansen_cache_dir") or (cache_root / "forest_masks"))
+    forest_mask = get_or_build_forest_mask(
+        tile,
+        tile_meta,
+        cache_dir=hansen_cache,
+        threshold=int(cfg.get("hansen_threshold", 30)),
+    )
+    # --- ENDE NEU ---
+
     out_dir.mkdir(parents=True, exist_ok=True)
     np.save(out_dir / "s2.npy", s2)
     np.save(out_dir / "s1_asc.npy", s1a)
     np.save(out_dir / "s1_desc.npy", s1d)
     np.save(out_dir / "aef.npy", aef)
+    np.save(out_dir / "forest_2020.npy", forest_mask)  # --- NEU ---
 
     _write_meta(
         out_dir, tile, split, crs, transform, H, W,
@@ -197,6 +240,9 @@ def main() -> None:
     ap.add_argument("--tiles", nargs="*", default=None, help="Tile names; default = all in split")
     ap.add_argument("--workers", type=int, default=None)
     ap.add_argument("--force", action="store_true")
+    # --- NEU ---
+    ap.add_argument("--hansen-cache-dir", type=Path, default=None)
+    ap.add_argument("--hansen-threshold", type=int, default=30)
     args = ap.parse_args()
 
     cfg = yaml.safe_load(args.config.read_text()) if args.config.exists() else {}
@@ -207,6 +253,9 @@ def main() -> None:
         "force": args.force,
         "s1_clip_db": cfg.get("s1_clip_db", [-30.0, 0.0]),
         "s1_epsilon_linear": cfg.get("s1_epsilon_linear", 1e-6),
+        # --- NEU ---
+        "hansen_cache_dir": str(args.hansen_cache_dir or cache_root / "forest_masks"),
+        "hansen_threshold": args.hansen_threshold,
     }
 
     splits = ["train", "test"] if args.split == "both" else [args.split]

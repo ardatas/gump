@@ -12,3 +12,5 @@ runs/
 submission/
 *.npy
 *.npz
+.artifacts
+submissions/
