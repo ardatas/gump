@@ -323,7 +323,7 @@ export default function GumpApp() {
         : YEAR_COLORS[extractYear(f) ?? 'unknown']
       return { color: c, weight: 1.5, fillColor: c, fillOpacity: 0.55, opacity: 0.9 }
     }
-    const layer = L.geoJSON(data as unknown as L.GeoJsonObject, {
+    const layer = L.geoJSON(data as unknown as Parameters<typeof L.geoJSON>[0], {
       style: (f) => styleFor(f as unknown as Feature),
       onEachFeature: (f, lyr) => {
         const feat = f as unknown as Feature
