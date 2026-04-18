@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=Path("configs/preprocess.yaml"), help="Path to preprocessing config to read cache_root from")
     parser.add_argument("--cache-root", type=Path, help="Override cache root path")
     parser.add_argument("--output-dir", type=Path, default=Path("/workspace/evaluation"), help="Directory to save evaluation results")
-    parser.add_argument("--split", choices=["train", "test"], default="test", help="Dataset split to evaluate on")
+    parser.add_argument("--split", choices=["train", "test"], default="train", help="Dataset split to evaluate on (use 'train' to evaluate on the model's validation regions since 'test' has no labels)")
     parser.add_argument("--eval-batch-size", type=int, default=131072)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--amp-dtype", choices=["none", "bf16", "fp16"], default="bf16")
@@ -118,6 +118,23 @@ def main() -> None:
     all_predictions = {name: [] for name in model_names}
     all_weights = {name: [] for name in model_names}
 
+    # Gather the union of all validation regions across all models
+    all_val_regions = set()
+    for payload in payloads:
+        all_val_regions.update(str(r) for r in payload.get("val_regions", []))
+    
+    if args.split == "train" and all_val_regions:
+        LOGGER.info("Filtering tile paths to only load regions used for validation: %s", sorted(list(all_val_regions)))
+        filtered_paths = []
+        for path in tile_paths:
+            try:
+                meta = load_tile_metadata(path)
+                if meta.region in all_val_regions:
+                    filtered_paths.append(path)
+            except Exception:
+                pass
+        tile_paths = filtered_paths
+
     LOGGER.info("Evaluating models on %d test tiles...", len(tile_paths))
 
     for tile_path in tqdm(tile_paths, desc="Processing Tiles", position=0):
@@ -132,6 +149,13 @@ def main() -> None:
             model_name = model_names[i]
             payload = payloads[i]
             
+            val_regions = tuple(str(value) for value in payload.get("val_regions", []))
+            
+            # If we're evaluating on the training split, we only want to test on the validation regions 
+            # to get a fair score.
+            if args.split == "train" and val_regions and tile.metadata.region not in val_regions:
+                continue
+                
             target_years = tuple(int(year) for year in payload["target_years"])
             
             # Build or get features for these specific target years
