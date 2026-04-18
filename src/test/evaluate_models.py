@@ -159,8 +159,10 @@ def main() -> None:
             target_years = tuple(int(year) for year in payload["target_years"])
             
             # Build or get features for these specific target years
+            # We must use use_cache=False, because the on-disk feature cube might have been built
+            # for a different set of target_years (e.g. 3 years = 682 feats) and loading it for a 1-year model crashes.
             if target_years not in built_features_cache:
-                built_features_cache[target_years] = build_tile_features(tile, target_years)
+                built_features_cache[target_years] = build_tile_features(tile, target_years, use_cache=False)
             
             tile_features = built_features_cache[target_years]
             
