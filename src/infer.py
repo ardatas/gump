@@ -122,9 +122,14 @@ def main() -> None:
         probability_dir.mkdir(parents=True, exist_ok=True)
 
     year_bundle = next((bundle for bundle in bundles if bundle.num_year_classes > 0), None)
-    heuristic_year_fallback = args.predict_time_step and year_bundle is None and len(target_years) >= 2
-    if args.predict_time_step and year_bundle is None and not heuristic_year_fallback:
-        LOGGER.warning("--predict-time-step requested but no year head present and <2 target years; time_step will be empty.")
+    # Auto-enable time_step prediction: use the year head when available, fall
+    # back to the NDVI/NBR heuristic otherwise.  Only suppress if explicitly
+    # opted out via --no-predict-time-step (not currently exposed) or if there
+    # is only a single target year (cannot compute year-over-year drop).
+    predict_time_step = args.predict_time_step or year_bundle is not None or len(target_years) >= 2
+    heuristic_year_fallback = predict_time_step and year_bundle is None and len(target_years) >= 2
+    if predict_time_step and year_bundle is None and not heuristic_year_fallback:
+        LOGGER.warning("Time-step prediction requested but no year head present and <2 target years; time_step will be empty.")
 
     for tile_path in list_tile_paths(args.cache_root, args.split):
         tile = load_tile_data(tile_path)
@@ -178,7 +183,7 @@ def main() -> None:
             write_raster(tile, probability_map.astype(np.float32), probability_path, dtype="float32", nodata=np.nan)
 
         time_step_map = None
-        if args.predict_time_step and year_bundle is not None and feature_matrix.shape[0] > 0:
+        if predict_time_step and year_bundle is not None and feature_matrix.shape[0] > 0:
             normalized_year = normalize_features(feature_matrix, year_bundle.normalizer)
             year_logits = predict_year_logits(
                 model=year_bundle.model,
@@ -233,9 +238,9 @@ def main() -> None:
                     "min_hole_area_ha": max(0.0, args.min_hole_area_ha),
                     "persistence_threshold": max(0.0, args.persistence_threshold),
                 },
-                "predict_time_step": args.predict_time_step and (year_bundle is not None or heuristic_year_fallback),
+                "predict_time_step": predict_time_step and (year_bundle is not None or heuristic_year_fallback),
                 "time_step_source": (
-                    "year_head" if (args.predict_time_step and year_bundle is not None)
+                    "year_head" if (predict_time_step and year_bundle is not None)
                     else ("ndvi_nbr_heuristic" if heuristic_year_fallback else "none")
                 ),
                 "threshold_offset": float(args.threshold_offset),
