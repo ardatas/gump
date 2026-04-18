@@ -663,7 +663,7 @@ def predict_probabilities(
             with autocast_context(runtime_config):
                 model_outputs = model(batch_features, sequence=batch_sequence)
                 probabilities = torch.sigmoid(model_outputs.logits)
-            outputs.append(probabilities.detach().cpu().numpy().astype(np.float32))
+            outputs.append(probabilities.detach().float().cpu().numpy())
     return np.concatenate(outputs, axis=0)
 
 

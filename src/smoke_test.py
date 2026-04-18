@@ -184,7 +184,7 @@ def main() -> None:
     check("Total loss with year head", _total_loss_with_year)
 
     def _label_smoothing():
-        logits = torch.zeros(16)
+        logits = torch.full((16,), 10.0)  # confident predictions
         labels = torch.ones(16)
         weights = torch.ones(16)
         cfg_no = LossConfig(name="bce", focal_gamma=2.0, positive_class_weight=None, gce_q=0.7, label_smoothing=0.0)
@@ -276,9 +276,9 @@ def main() -> None:
         mask[2, 1] = True
         out = scatter_predictions(values, mask, dtype=np.float32)
         assert out.shape == (3, 3)
-        assert out[0, 0] == 0.5
-        assert out[1, 2] == 0.9
-        assert out[2, 1] == 0.1
+        assert np.isclose(out[0, 0], 0.5)
+        assert np.isclose(out[1, 2], 0.9)
+        assert np.isclose(out[2, 1], 0.1)
         assert out[0, 1] == 0.0
     check("scatter_predictions", _scatter)
 
