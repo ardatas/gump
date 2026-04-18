@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback } from 'react'
-import type { Map as LeafletMap, GeoJSON as LeafletGeoJSON } from 'leaflet'
+import type { Map as LeafletMap, GeoJSON as LeafletGeoJSON, Rectangle as LeafletRectangle } from 'leaflet'
 
 const YEAR_COLORS: Record<number | string, string> = {
   2020: '#fde68a', 2021: '#fbbf24', 2022: '#f97316',
@@ -50,12 +50,14 @@ interface RunDetail {
   artifacts_ready: boolean
 }
 
+interface TileBounds { min_lon: number; min_lat: number; max_lon: number; max_lat: number }
 interface TileSummary {
   tile_id: string
   status: string
   threshold: number | null
   artifacts: { geojson: boolean; overlay_png: boolean; prob_tif: boolean }
   paths: { geojson?: string; overlay_png?: string; prob_tif?: string }
+  bounds: TileBounds | null
 }
 
 type ColorMode = 'year' | 'confidence'
@@ -118,6 +120,7 @@ export default function GumpApp() {
   const mapRef = useRef<HTMLDivElement>(null)
   const leafletMap = useRef<LeafletMap | null>(null)
   const filesRef = useRef<FileEntry[]>([])
+  const tileBoundsLayersRef = useRef<{ tile_id: string; rect: LeafletRectangle }[]>([])
   const nextId = useRef(1)
   const colorModeRef = useRef<ColorMode>('year')
 
@@ -141,6 +144,7 @@ export default function GumpApp() {
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null)
   const [availableTiles, setAvailableTiles] = useState<TileSummary[]>([])
+  const [activeTileIdx, setActiveTileIdx] = useState<number | null>(null)
 
   const showToast = useCallback((msg: string) => {
     setToast(msg); clearTimeout(toastTimer.current)
@@ -220,19 +224,30 @@ export default function GumpApp() {
         if (!data || !data.tiles) return
         setAvailableTiles(data.tiles)
         
-        // Clear existing map layers
+        // Clear existing map layers and tile bounds
         filesRef.current.forEach(f => f.layer.remove())
         filesRef.current = []
         setFiles([])
-        
+        tileBoundsLayersRef.current.forEach(({ rect }) => rect.remove())
+        tileBoundsLayersRef.current = []
+        setActiveTileIdx(null)
+
         // Load GeoJSON for each tile
         if (!leafletMap.current) return
         const L = (await import('leaflet')).default
+
         for (const t of data.tiles) {
+          // Draw tile boundary rectangle
+          if (t.bounds) {
+            const { min_lat, min_lon, max_lat, max_lon } = t.bounds
+            const rect = L.rectangle([[min_lat, min_lon], [max_lat, max_lon]], {
+              color: '#94a3b8', weight: 1.5, fill: false, dashArray: '6 4', opacity: 0.7,
+            }).addTo(leafletMap.current!)
+            rect.bindTooltip(t.tile_id, { permanent: false, direction: 'center', className: 'tile-label' })
+            tileBoundsLayersRef.current.push({ tile_id: t.tile_id, rect })
+          }
+
           if (t.paths.geojson) {
-            // Note: Since Nginx serving isn't strictly set up yet, we point it to the raw file path 
-            // by modifying Next.js rewrites or serving it through API. 
-            // For now, assuming Nginx exposes /artifacts
             const url = `http://${window.location.hostname}:8000${t.paths.geojson}`
             try {
               const res = await fetch(url)
@@ -245,6 +260,8 @@ export default function GumpApp() {
             }
           }
         }
+
+        if (data.tiles.length > 0) setActiveTileIdx(0)
       })
   }, [activeRunId])
 
@@ -348,6 +365,26 @@ export default function GumpApp() {
     for (const file of arr) {
       try { ingest(file.name, JSON.parse(await file.text()), leafletMap.current, L) }
       catch (e) { showToast(`⚠ ${file.name}: ${(e as Error).message}`) }
+    }
+  }
+
+  function jumpToTile(idx: number) {
+    const tiles = availableTiles
+    if (!tiles.length || !leafletMap.current) return
+    const i = (idx + tiles.length) % tiles.length
+    setActiveTileIdx(i)
+    const t = tiles[i]
+    // Highlight: reset all rects, emphasise the active one
+    tileBoundsLayersRef.current.forEach(({ tile_id, rect }) => {
+      if (tile_id === t.tile_id) {
+        rect.setStyle({ color: '#38bdf8', weight: 2.5, opacity: 1 })
+      } else {
+        rect.setStyle({ color: '#94a3b8', weight: 1.5, opacity: 0.7 })
+      }
+    })
+    if (t.bounds) {
+      const { min_lat, min_lon, max_lat, max_lon } = t.bounds
+      leafletMap.current.fitBounds([[min_lat, min_lon], [max_lat, max_lon]], { padding: [60, 60], maxZoom: 13 })
     }
   }
 
@@ -458,6 +495,34 @@ export default function GumpApp() {
 
       {/* SIDEBAR */}
       <aside className="sidebar">
+        {availableTiles.length > 0 && (
+          <section className="panel">
+            <h2>Tile Navigator</h2>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+              <button className="btn" style={{ padding: '4px 10px', minWidth: 32 }}
+                onClick={() => jumpToTile((activeTileIdx ?? 0) - 1)}>‹</button>
+              <span style={{ flex: 1, textAlign: 'center', fontFamily: 'monospace', fontSize: 13 }}>
+                {activeTileIdx !== null ? availableTiles[activeTileIdx]?.tile_id : '—'}
+              </span>
+              <button className="btn" style={{ padding: '4px 10px', minWidth: 32 }}
+                onClick={() => jumpToTile((activeTileIdx ?? 0) + 1)}>›</button>
+            </div>
+            <ul className="file-list" style={{ maxHeight: 140, overflowY: 'auto' }}>
+              {availableTiles.map((t, i) => (
+                <li key={t.tile_id}
+                  style={{ cursor: 'pointer', background: i === activeTileIdx ? 'var(--surface-2, #1e293b)' : undefined }}
+                  onClick={() => jumpToTile(i)}>
+                  <span className="fname" style={{ fontFamily: 'monospace', fontSize: 12 }}>{t.tile_id}</span>
+                  <span className="fcount">{t.artifacts.geojson ? '●' : '○'}</span>
+                </li>
+              ))}
+            </ul>
+            <p className="muted small" style={{ marginTop: 6 }}>
+              {activeTileIdx !== null ? `${activeTileIdx + 1} / ${availableTiles.length}` : `${availableTiles.length} tiles`}
+            </p>
+          </section>
+        )}
+
         <section className="panel metrics-panel">
           <h2>Modell-Metriken</h2>
           {runDetail ? (

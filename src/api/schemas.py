@@ -28,7 +28,7 @@ class RunDetailResponse(BaseModel):
     status: str
     config: dict[str, Any] | None = None
     metrics: dict[str, Any] | None = None
-    history: dict[str, Any] | None = None
+    history: list[dict[str, Any]] | None = None
     tiles: list[str] = Field(default_factory=list)
     artifacts_ready: bool = False
 
@@ -42,6 +42,13 @@ class TileArtifacts(BaseModel):
     prob_tif: bool = False
     uncertainty_tif: bool = False
 
+class TileBounds(BaseModel):
+    """WGS84 bounding box [min_lon, min_lat, max_lon, max_lat]"""
+    min_lon: float
+    min_lat: float
+    max_lon: float
+    max_lat: float
+
 class TileSummary(BaseModel):
     run_id: str
     tile_id: str
@@ -50,6 +57,7 @@ class TileSummary(BaseModel):
     artifacts: TileArtifacts = Field(default_factory=TileArtifacts)
     paths: dict[str, str] = Field(default_factory=dict)
     metrics: TileSummaryMetrics = Field(default_factory=TileSummaryMetrics)
+    bounds: TileBounds | None = None
 
 class TileListResponse(BaseModel):
     run_id: str

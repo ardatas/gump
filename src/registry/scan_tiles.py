@@ -2,10 +2,41 @@ import json
 import logging
 from pathlib import Path
 
-from src.common.paths import ARTIFACTS_DIR
-from src.api.schemas import TileSummary, TileArtifacts, TileSummaryMetrics
+from src.common.paths import ARTIFACTS_DIR, CACHE_DIR
+from src.api.schemas import TileSummary, TileArtifacts, TileSummaryMetrics, TileBounds
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _compute_bounds(tile_id: str) -> TileBounds | None:
+    meta_path = CACHE_DIR / tile_id / "meta.json"
+    if not meta_path.exists():
+        meta_path = CACHE_DIR / "gump" / tile_id / "meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        crs = meta["crs"]
+        tr = meta["transform"]   # [px, 0, origin_x, 0, py, origin_y]
+        w, h = meta["width"], meta["height"]
+        ox, oy = tr[2], tr[5]
+        px, py = tr[0], tr[4]
+        # corners in projected CRS
+        xs = [ox, ox + px * w]
+        ys = [oy, oy + py * h]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        from pyproj import Transformer
+        t = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+        lons, lats = t.transform([min_x, max_x], [min_y, max_y])
+        return TileBounds(
+            min_lon=min(lons), min_lat=min(lats),
+            max_lon=max(lons), max_lat=max(lats),
+        )
+    except Exception as e:
+        LOGGER.warning("Could not compute bounds for %s: %s", tile_id, e)
+        return None
 
 def get_tile_summary(run_id: str, tile_id: str) -> TileSummary | None:
     tile_dir = ARTIFACTS_DIR / run_id / tile_id
@@ -18,7 +49,6 @@ def get_tile_summary(run_id: str, tile_id: str) -> TileSummary | None:
         try:
             with open(summary_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            # Reconstruct the schema
             return TileSummary(
                 run_id=data.get("run_id", run_id),
                 tile_id=data.get("tile_id", tile_id),
@@ -26,21 +56,22 @@ def get_tile_summary(run_id: str, tile_id: str) -> TileSummary | None:
                 threshold=data.get("threshold"),
                 artifacts=TileArtifacts(**data.get("artifacts", {})),
                 paths=data.get("paths", {}),
-                metrics=TileSummaryMetrics(**data.get("metrics", {}))
+                metrics=TileSummaryMetrics(**data.get("metrics", {})),
+                bounds=_compute_bounds(tile_id),
             )
         except Exception as e:
             LOGGER.warning("Failed to parse summary.json in %s: %s", tile_dir, e)
-            
+
     # Fallback: construct it from files if no summary exists
     has_geojson = (tile_dir / "pred.geojson").exists()
     has_overlay = (tile_dir / "overlay.png").exists()
     has_prob = (tile_dir / "prob.tif").exists()
-    
+
     paths = {}
     if has_geojson: paths["geojson"] = f"/artifacts/{run_id}/{tile_id}/pred.geojson"
     if has_overlay: paths["overlay_png"] = f"/artifacts/{run_id}/{tile_id}/overlay.png"
     if has_prob: paths["prob_tif"] = f"/artifacts/{run_id}/{tile_id}/prob.tif"
-    
+
     return TileSummary(
         run_id=run_id,
         tile_id=tile_id,
@@ -48,9 +79,10 @@ def get_tile_summary(run_id: str, tile_id: str) -> TileSummary | None:
         artifacts=TileArtifacts(
             geojson=has_geojson,
             overlay_png=has_overlay,
-            prob_tif=has_prob
+            prob_tif=has_prob,
         ),
-        paths=paths
+        paths=paths,
+        bounds=_compute_bounds(tile_id),
     )
 
 def get_all_tiles_for_run(run_id: str) -> list[TileSummary]:
