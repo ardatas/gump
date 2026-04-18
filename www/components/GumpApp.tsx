@@ -30,7 +30,40 @@ interface Metrics {
   val_split_strategy?: string
 }
 
+// Backend API Interfaces
+interface RunSummary {
+  run_id: string
+  status: string
+  model_type: string | null
+  created_at: string | null
+  artifact_tile_count: number
+  metrics: { val_f1: number | null; val_iou: number | null; pr_auc: number | null }
+}
+
+interface RunDetail {
+  run_id: string
+  status: string
+  config: any
+  metrics: any
+  history: any
+  tiles: string[]
+  artifacts_ready: boolean
+}
+
+interface TileSummary {
+  tile_id: string
+  status: string
+  threshold: number | null
+  artifacts: { geojson: boolean; overlay_png: boolean; prob_tif: boolean }
+  paths: { geojson?: string; overlay_png?: string; prob_tif?: string }
+}
+
 type ColorMode = 'year' | 'confidence'
+
+// Ensure API URL points to the backend automatically
+const API_BASE = (typeof window !== 'undefined' && window.location.hostname) 
+  ? `http://${window.location.hostname}:8000/api` 
+  : 'http://localhost:8000/api';
 
 function confColor(c: number): string {
   if (c < 0.5) return '#ef4444'
@@ -99,9 +132,15 @@ export default function GumpApp() {
   const [isDragging, setIsDragging] = useState(false)
   const [basemap, setBasemap] = useState('satellite')
   const [searchQuery, setSearchQuery] = useState('')
-  const [metrics, setMetrics] = useState<Metrics | null>(null)
+  const [metrics, setMetrics] = useState<Metrics | null>(null) // Deprecated mostly
   const [colorMode, setColorMode] = useState<ColorMode>('year')
   const toastTimer = useRef<ReturnType<typeof setTimeout>>()
+
+  // Backend State
+  const [runs, setRuns] = useState<RunSummary[]>([])
+  const [activeRunId, setActiveRunId] = useState<string | null>(null)
+  const [runDetail, setRunDetail] = useState<RunDetail | null>(null)
+  const [availableTiles, setAvailableTiles] = useState<TileSummary[]>([])
 
   const showToast = useCallback((msg: string) => {
     setToast(msg); clearTimeout(toastTimer.current)
@@ -147,23 +186,67 @@ export default function GumpApp() {
       }
       legend.addTo(map)
 
-      // auto-load
-      fetch('/data/index.json').then(r => r.ok ? r.json() : null).then(async (list: string[] | null) => {
-        if (!list) return
-        for (const fname of list) {
-          const r = await fetch(`/data/${fname}`)
-          if (r.ok) ingest(fname, await r.json(), map, L)
-        }
-      }).catch(() => {})
-
-      // metrics
-      fetch('/data/metrics.json').then(r => r.ok ? r.json() : null).then((m: Metrics | null) => {
-        if (m) setMetrics(m)
-      }).catch(() => {})
+      // Fetch available runs from API
+      fetch(`${API_BASE}/runs`)
+        .then(r => r.ok ? r.json() : null)
+        .then((data: { runs: RunSummary[] } | null) => {
+          if (data && data.runs.length > 0) {
+            setRuns(data.runs)
+            // Auto-select latest finished run with artifacts
+            const bestRun = data.runs.find(r => r.status === 'finished' && r.artifact_tile_count > 0) || data.runs[0]
+            if (bestRun) setActiveRunId(bestRun.run_id)
+          }
+        }).catch(err => console.error("Failed to load runs", err))
     })
     return () => { cancelled = true; leafletMap.current?.remove(); leafletMap.current = null }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Load run details & tiles when activeRunId changes
+  useEffect(() => {
+    if (!activeRunId) return
+    
+    // Load metrics/config
+    fetch(`${API_BASE}/runs/${activeRunId}`)
+      .then(r => r.ok ? r.json() : null)
+      .then((detail: RunDetail | null) => {
+        if (detail) setRunDetail(detail)
+      })
+
+    // Load available tiles (GeoJSONs)
+    fetch(`${API_BASE}/runs/${activeRunId}/tiles`)
+      .then(r => r.ok ? r.json() : null)
+      .then(async (data: { tiles: TileSummary[] } | null) => {
+        if (!data || !data.tiles) return
+        setAvailableTiles(data.tiles)
+        
+        // Clear existing map layers
+        filesRef.current.forEach(f => f.layer.remove())
+        filesRef.current = []
+        setFiles([])
+        
+        // Load GeoJSON for each tile
+        if (!leafletMap.current) return
+        const L = (await import('leaflet')).default
+        for (const t of data.tiles) {
+          if (t.paths.geojson) {
+            // Note: Since Nginx serving isn't strictly set up yet, we point it to the raw file path 
+            // by modifying Next.js rewrites or serving it through API. 
+            // For now, assuming Nginx exposes /artifacts
+            const url = `http://${window.location.hostname}:8000${t.paths.geojson}`
+            try {
+              const res = await fetch(url)
+              if (res.ok) {
+                const geojson = await res.json()
+                ingest(t.tile_id, geojson, leafletMap.current, L)
+              }
+            } catch (e) {
+              console.error(`Failed to load tile ${t.tile_id}`, e)
+            }
+          }
+        }
+      })
+  }, [activeRunId])
 
   // basemap switch
   useEffect(() => {
@@ -350,6 +433,22 @@ export default function GumpApp() {
           <div className="hstat"><span className="hstat-value">{stats.yearMin ? (stats.yearMin === stats.yearMax ? `${stats.yearMin}` : `${stats.yearMin}–${stats.yearMax}`) : '—'}</span><span className="hstat-label">Zeitraum</span></div>
         </div>
         <div className="topbar-actions">
+          {/* Run Selector */}
+          <div style={{ marginRight: 15 }}>
+            <select 
+              className="input" 
+              style={{ width: 220, padding: '6px 10px' }}
+              value={activeRunId || ''} 
+              onChange={e => setActiveRunId(e.target.value)}
+            >
+              <option value="" disabled>Select Model Run...</option>
+              {runs.map(r => (
+                <option key={r.run_id} value={r.run_id}>
+                  {r.run_id} {r.status === 'finished' ? '✓' : ''}
+                </option>
+              ))}
+            </select>
+          </div>
           <button className="btn-ghost" onClick={() => setModalOpen(true)}>
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
             Info
@@ -361,41 +460,27 @@ export default function GumpApp() {
       <aside className="sidebar">
         <section className="panel metrics-panel">
           <h2>Modell-Metriken</h2>
-          {metrics && metrics.overall.f1 != null ? (
+          {runDetail ? (
             <>
               <div className="metric-big">
-                <div className="metric-big-value">{(metrics.overall.f1 * 100).toFixed(1)}</div>
+                <div className="metric-big-value">{runDetail.metrics?.val_f1 != null ? (runDetail.metrics.val_f1 * 100).toFixed(1) : '—'}</div>
                 <div className="metric-big-label">F1-Score (Val)</div>
               </div>
               <div className="metric-row">
-                <div className="metric-cell"><span className="metric-val">{metrics.overall.precision != null ? (metrics.overall.precision * 100).toFixed(1) : '—'}</span><span className="metric-lbl">Precision</span></div>
-                <div className="metric-cell"><span className="metric-val">{metrics.overall.recall != null ? (metrics.overall.recall * 100).toFixed(1) : '—'}</span><span className="metric-lbl">Recall</span></div>
-                <div className="metric-cell"><span className="metric-val">{metrics.overall.pr_auc != null ? (metrics.overall.pr_auc * 100).toFixed(1) : '—'}</span><span className="metric-lbl">PR-AUC</span></div>
+                <div className="metric-cell"><span className="metric-val">{runDetail.metrics?.val_iou != null ? (runDetail.metrics.val_iou * 100).toFixed(1) : '—'}</span><span className="metric-lbl">Val IoU</span></div>
+                <div className="metric-cell"><span className="metric-val">{runDetail.metrics?.best_threshold != null ? runDetail.metrics.best_threshold.toFixed(2) : '—'}</span><span className="metric-lbl">Threshold</span></div>
+                <div className="metric-cell"><span className="metric-val">{runDetail.config?.model ?? 'Baseline'}</span><span className="metric-lbl">Architektur</span></div>
               </div>
-              {Object.keys(metrics.per_region).length > 0 && (
-                <div className="metric-regions">
-                  <div className="metric-regions-title">Pro Region</div>
-                  {Object.entries(metrics.per_region).map(([region, m]) => (
-                    <div key={region} className="metric-region-row">
-                      <span className="metric-region-name">{region}</span>
-                      <div className="metric-region-bar">
-                        <div className="metric-region-fill" style={{ width: `${(m.f1 ?? 0) * 100}%` }} />
-                      </div>
-                      <span className="metric-region-val">{m.f1 != null ? (m.f1 * 100).toFixed(0) : '—'}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
               <p className="muted small" style={{ marginTop: 10 }}>
-                {metrics.model ?? 'Baseline'} · thr={metrics.threshold?.toFixed(2) ?? '—'} · {metrics.n_tiles_train}/{metrics.n_tiles_val} Tiles (train/val)
+                Run: {runDetail.run_id} <br/>
+                Status: {runDetail.status} · Artifacts: {runDetail.tiles.length} Tiles
               </p>
             </>
           ) : (
             <div className="metrics-placeholder">
               <div className="metrics-placeholder-pulse" />
-              <p><strong>Training läuft…</strong></p>
-              <p className="muted small">Metriken erscheinen hier, sobald das Baseline-Modell fertig trainiert ist.</p>
-              {metrics?.val_split_strategy && <p className="muted small" style={{ marginTop: 8 }}>Split: {metrics.val_split_strategy}</p>}
+              <p><strong>Lade Modelldaten…</strong></p>
+              <p className="muted small">Bitte einen Run im Menü oben auswählen.</p>
             </div>
           )}
         </section>
@@ -413,7 +498,7 @@ export default function GumpApp() {
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
             </svg>
             <p><strong>Drag &amp; Drop</strong></p>
-            <p className="muted small">GeoJSON-Dateien hier ablegen</p>
+            <p className="muted small">Lokale GeoJSON-Dateien hier ablegen (optional)</p>
             <label className="btn" style={{ cursor: 'pointer', marginTop: 8 }}>
               Oder Dateien wählen
               <input type="file" accept=".geojson,.json" multiple hidden onChange={e => { if (e.target.files) handleFiles(e.target.files); e.target.value = '' }} />

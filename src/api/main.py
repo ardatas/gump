@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from src.common.paths import ensure_workspace_dirs
+from fastapi.staticfiles import StaticFiles
+from src.common.paths import ensure_workspace_dirs, ARTIFACTS_DIR
 
 from src.api.routes import health, runs, tiles, jobs
 
@@ -21,6 +22,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Serve static artifacts (like GeoJSON and PNG overlays)
+app.mount("/artifacts", StaticFiles(directory=ARTIFACTS_DIR), name="artifacts")
 
 app.include_router(health.router, prefix="/api", tags=["System"])
 app.include_router(runs.router, prefix="/api/runs", tags=["Runs"])
