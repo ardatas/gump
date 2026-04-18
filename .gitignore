@@ -4,8 +4,6 @@ __pycache__/
 .DS_Store
 .venv/
 venv/
-data/
-cache/
 runs/
 submission/
 *.npy
