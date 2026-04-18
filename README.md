@@ -30,14 +30,18 @@ python -m src.train \
   --model-name resmlp \
   --loss focal \
   --amp-dtype bf16 \
-  --auto-positive-class-weight
+  --auto-positive-class-weight \
+  --prep-workers 8 \
+  --gpu-resident-data auto
 ```
 
 The baseline trainer:
 
 - builds tabular per-pixel features from the Zarr caches
+- parallelizes train/validation feature prep with `--prep-workers`
 - uses a region-held-out validation split
 - supports `mlp` and `resmlp`
+- can pin static train/eval tensors on GPU for `mlp`/`resmlp` via `--gpu-resident-data`
 - supports weighted BCE or focal loss, optional auto class weighting, gradient clipping, AMP, cosine LR scheduling, early stopping, and resume from `last.pt`
 - saves `best.pt`, `last.pt`, metrics, and run config under `runs/`
 

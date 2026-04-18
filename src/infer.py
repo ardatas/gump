@@ -62,9 +62,13 @@ def parse_args() -> argparse.Namespace:
                         help="Additive offset applied to the base threshold (negative = more recall, positive = more precision).")
     parser.add_argument("--per-region-thresholds", type=Path, help="Optional JSON mapping region -> threshold.")
     parser.add_argument("--save-probabilities", action="store_true")
-    parser.add_argument("--closing-radius", type=int, default=2)
-    parser.add_argument("--opening-radius", type=int, default=1)
-    parser.add_argument("--min-area-ha", type=float, default=0.5)
+    # Default postprocessing below was tuned down after observing that the
+    # previous defaults (closing=2, opening=1, min_area=0.5) shrank or deleted
+    # small real clearings (smallholder deforestation is often 0.1-0.3 ha).
+    # Keep the flags explicit so ablations via `src.evaluate` remain possible.
+    parser.add_argument("--closing-radius", type=int, default=1)
+    parser.add_argument("--opening-radius", type=int, default=0)
+    parser.add_argument("--min-area-ha", type=float, default=0.2)
     parser.add_argument("--min-hole-area-ha", type=float, default=0.0)
     parser.add_argument("--persistence-threshold", type=float, default=0.0)
     parser.add_argument("--predict-time-step", action="store_true",
@@ -120,6 +124,9 @@ def run_tile_inference(
     )
 
     year_bundle = next((bundle for bundle in bundles if bundle.num_year_classes > 0), None)
+    # Auto-enable time_step prediction: use year head when available, fall back to heuristic otherwise.
+    do_predict_time_step = predict_time_step or year_bundle is not None or len(target_years) >= 2
+    heuristic_year_fallback = do_predict_time_step and year_bundle is None and len(target_years) >= 2
 
     # Locate the requested tile
     tile_path = None
@@ -143,17 +150,12 @@ def run_tile_inference(
 
     ensemble_probabilities = np.zeros(feature_matrix.shape[0], dtype=np.float32)
     for bundle in bundles:
-        bundle_feature_matrix = feature_matrix
-        if bundle.feature_names and hasattr(tile_features, "feature_names") and tile_features.feature_names:
-            feature_indices = []
-            for expected_name in bundle.feature_names:
-                try:
-                    idx = tile_features.feature_names.index(expected_name)
-                    feature_indices.append(idx)
-                except ValueError:
-                    pass
-            bundle_feature_matrix = feature_matrix[:, feature_indices]
-            
+        bundle_feature_matrix = _select_checkpoint_features(
+            feature_matrix,
+            current_feature_names=tile_features.feature_names,
+            checkpoint_feature_names=bundle.feature_names,
+            checkpoint_path=bundle.path,
+        )
         normalized = normalize_features(bundle_feature_matrix, bundle.normalizer)
         bundle_sequence = sequence_matrix if bundle.sequence_channels > 0 else None
         tile_probabilities = predict_probabilities(
@@ -164,12 +166,12 @@ def run_tile_inference(
             sequences=bundle_sequence,
         )
         ensemble_probabilities += tile_probabilities
-        
+
     if bundles:
         ensemble_probabilities /= len(bundles)
 
     probability_map = scatter_predictions(ensemble_probabilities, prediction_mask, dtype=np.float32)
-    
+
     postprocess_config = PostprocessConfig(
         threshold=base_threshold,
         closing_radius=max(0, closing_radius) if morph_cleanup else 0,
@@ -186,12 +188,41 @@ def run_tile_inference(
         persistence_score=tile_features.persistence_score,
     )
 
+    # Year / time_step prediction
+    time_step_map = None
+    if do_predict_time_step and year_bundle is not None and feature_matrix.shape[0] > 0:
+        year_features = _select_checkpoint_features(
+            feature_matrix,
+            current_feature_names=tile_features.feature_names,
+            checkpoint_feature_names=year_bundle.feature_names,
+            checkpoint_path=year_bundle.path,
+        )
+        normalized_year = normalize_features(year_features, year_bundle.normalizer)
+        year_logits = predict_year_logits(
+            model=year_bundle.model,
+            features=normalized_year,
+            sequences=sequence_matrix if year_bundle.sequence_channels > 0 else None,
+            runtime_config=runtime_config,
+            batch_size=eval_batch_size,
+        )
+        if year_logits is not None and year_bundle.year_min is not None:
+            predicted_class = year_logits.argmax(axis=-1)
+            predicted_year = predicted_class + int(year_bundle.year_min)
+            time_step_map = scatter_predictions(
+                predicted_year.astype(np.float32),
+                prediction_mask,
+                fill_value=np.nan,
+                dtype=np.float32,
+            )
+    elif heuristic_year_fallback:
+        time_step_map = compute_year_heuristic_map(tile, target_years)
+
     tile_output_dir = output_root / tile_id
     tile_output_dir.mkdir(parents=True, exist_ok=True)
 
     prob_path = tile_output_dir / "prob.tif"
     write_raster(tile, probability_map.astype(np.float32), prob_path, dtype="float32", nodata=np.nan)
-    
+
     raster_path = tile_output_dir / "pred.tif"
     write_raster(tile, prediction.astype(np.uint8), raster_path, dtype="uint8", nodata=0)
 
@@ -203,14 +234,31 @@ def run_tile_inference(
                 output_path=geojson_path,
                 min_area_ha=postprocess_config.min_area_ha,
             )
+            if time_step_map is not None:
+                _attach_time_step_to_geojson(
+                    geojson_path,
+                    time_step_map=time_step_map,
+                    prediction_mask=prediction.astype(bool),
+                    transform=rasterio.Affine(*tile.metadata.transform),
+                    crs=tile.metadata.crs,
+                )
         else:
             geojson_path.write_text(json.dumps(empty_feature_collection()))
-            
+
     if export_overlay:
         _create_overlay_png(tile, prediction, tile_output_dir / "overlay.png")
 
-    LOGGER.info("Wrote predictions for %s to %s", tile_id, tile_output_dir)
-    return {"used_threshold": base_threshold, "tile_id": tile_id}
+    time_step_source = (
+        "year_head" if (do_predict_time_step and year_bundle is not None)
+        else ("ndvi_nbr_heuristic" if heuristic_year_fallback else "none")
+    )
+    LOGGER.info("Wrote predictions for %s to %s (time_step: %s)", tile_id, tile_output_dir, time_step_source)
+    return {
+        "used_threshold": base_threshold,
+        "tile_id": tile_id,
+        "predict_time_step": do_predict_time_step and time_step_map is not None,
+        "time_step_source": time_step_source,
+    }
 
 def _create_overlay_png(tile, prediction_mask: np.ndarray, output_path: Path):
     """Helper for backend to generate a colored PNG overlay for web UI."""
