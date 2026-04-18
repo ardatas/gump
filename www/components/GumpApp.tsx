@@ -184,6 +184,11 @@ export default function GumpApp() {
       L.control.zoom({ position: 'topright' }).addTo(map)
       leafletMap.current = map
 
+      // Custom pane for satellite imagery — sits above basemap (200) but below vectors (400)
+      const satPane = map.createPane('satellite')
+      satPane.style.zIndex = '250'
+      satPane.style.pointerEvents = 'none'
+
       const tiles: Record<string, L.TileLayer> = {
         satellite: L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Imagery © Esri', maxZoom: 19 }),
         terrain: L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', { attribution: '© OpenTopoMap', maxZoom: 17 }),
@@ -293,7 +298,7 @@ export default function GumpApp() {
     import('leaflet').then(({ default: L }) => {
       // Remove previous overlay
       satelliteOverlayRef.current?.remove()
-      const overlay = L.imageOverlay(url, bounds, { opacity: 0.85, zIndex: 200 })
+      const overlay = L.imageOverlay(url, bounds, { opacity: 0.85, pane: 'satellite' })
       overlay.addTo(leafletMap.current!)
       overlay.on('load', () => setSatelliteLoading(false))
       overlay.on('error', () => setSatelliteLoading(false))
