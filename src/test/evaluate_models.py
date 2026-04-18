@@ -85,7 +85,17 @@ def main() -> None:
         LOGGER.error("No best.pt checkpoints found in %s", runs_dir)
         return
 
-    tile_paths = list_tile_paths(cache_root, args.split)
+    # Discover tile paths by checking the Zarr metadata directly
+    tile_paths = []
+    for path in cache_root.iterdir():
+        if path.is_dir() and not path.name.startswith("."):
+            try:
+                metadata = load_tile_metadata(path)
+                if metadata.split == args.split:
+                    tile_paths.append(path)
+            except Exception as e:
+                pass # skip directories that are not valid zarr tiles
+
     if not tile_paths:
         raise SystemExit(f"No evaluation tiles found for split '{args.split}' in {cache_root}.")
 
