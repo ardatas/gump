@@ -73,6 +73,155 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def run_tile_inference(
+    cache_root: Path,
+    checkpoint_paths: list[Path],
+    output_root: Path,
+    tile_id: str,
+    split: str = "test",
+    eval_batch_size: int = 131072,
+    device_name: str = "cuda",
+    amp_dtype_name: str = "bf16",
+    threshold_override: float | None = None,
+    closing_radius: int = 1,
+    opening_radius: int = 1,
+    min_area_ha: float = 0.5,
+    min_hole_area_ha: float = 0.0,
+    persistence_threshold: float = 0.0,
+    predict_time_step: bool = False,
+    export_geojson: bool = True,
+    export_overlay: bool = True,
+    morph_cleanup: bool = True
+) -> dict[str, object]:
+    """Runs inference on a single tile for the backend API/Worker."""
+    import logging
+    LOGGER = logging.getLogger(__name__)
+    
+    device = torch.device(device_name if torch.cuda.is_available() else "cpu")
+    runtime_config = RuntimeConfig(
+        device=device,
+        amp_dtype=resolve_amp_dtype(amp_dtype_name, device),
+        grad_clip_norm=0.0,
+    )
+
+    bundles = [load_checkpoint_bundle(path, device) for path in checkpoint_paths]
+    if not bundles:
+        raise ValueError("At least one checkpoint is required.")
+
+    primary_bundle = bundles[0]
+    target_years = primary_bundle.target_years
+    target_months = primary_bundle.target_months
+    needs_sequence = any(bundle.sequence_channels > 0 for bundle in bundles)
+
+    base_threshold = (
+        float(threshold_override)
+        if threshold_override is not None
+        else float(np.mean([bundle.threshold for bundle in bundles]))
+    )
+
+    year_bundle = next((bundle for bundle in bundles if bundle.num_year_classes > 0), None)
+
+    # Locate the requested tile
+    tile_path = None
+    for path in list_tile_paths(cache_root, split):
+        if path.name.replace(".zarr", "") == tile_id:
+            tile_path = path
+            break
+            
+    if not tile_path:
+        raise FileNotFoundError(f"Tile {tile_id} not found in {cache_root}/{split}")
+
+    tile = load_tile_data(tile_path)
+    metadata = load_tile_metadata(tile_path)
+    tile_features = build_tile_features(tile, target_years, use_cache=False)
+    feature_matrix, prediction_mask = build_prediction_matrix(tile_features)
+
+    sequence_matrix = None
+    if needs_sequence and feature_matrix.shape[0] > 0:
+        sequence = build_monthly_sequence(tile, target_months)
+        sequence_matrix = gather_prediction_sequences(sequence, prediction_mask)
+
+    ensemble_probabilities = np.zeros(feature_matrix.shape[0], dtype=np.float32)
+    for bundle in bundles:
+        bundle_feature_matrix = feature_matrix
+        if bundle.feature_names and hasattr(tile_features, "feature_names") and tile_features.feature_names:
+            feature_indices = []
+            for expected_name in bundle.feature_names:
+                try:
+                    idx = tile_features.feature_names.index(expected_name)
+                    feature_indices.append(idx)
+                except ValueError:
+                    pass
+            bundle_feature_matrix = feature_matrix[:, feature_indices]
+            
+        normalized = normalize_features(bundle_feature_matrix, bundle.normalizer)
+        bundle_sequence = sequence_matrix if bundle.sequence_channels > 0 else None
+        tile_probabilities = predict_probabilities(
+            model=bundle.model,
+            features=normalized,
+            runtime_config=runtime_config,
+            batch_size=eval_batch_size,
+            sequences=bundle_sequence,
+        )
+        ensemble_probabilities += tile_probabilities
+        
+    if bundles:
+        ensemble_probabilities /= len(bundles)
+
+    probability_map = scatter_predictions(ensemble_probabilities, prediction_mask, dtype=np.float32)
+    
+    postprocess_config = PostprocessConfig(
+        threshold=base_threshold,
+        closing_radius=max(0, closing_radius) if morph_cleanup else 0,
+        opening_radius=max(0, opening_radius) if morph_cleanup else 0,
+        min_area_ha=max(0.0, min_area_ha) if morph_cleanup else 0.0,
+        min_hole_area_ha=max(0.0, min_hole_area_ha) if morph_cleanup else 0.0,
+        persistence_threshold=max(0.0, persistence_threshold),
+    )
+    prediction = postprocess_probability_map(
+        probability_map,
+        forest_mask=tile.forest_mask,
+        transform=rasterio.Affine(*tile.metadata.transform),
+        config=postprocess_config,
+        persistence_score=tile_features.persistence_score,
+    )
+
+    tile_output_dir = output_root / tile_id
+    tile_output_dir.mkdir(parents=True, exist_ok=True)
+
+    prob_path = tile_output_dir / "prob.tif"
+    write_raster(tile, probability_map.astype(np.float32), prob_path, dtype="float32", nodata=np.nan)
+    
+    raster_path = tile_output_dir / "pred.tif"
+    write_raster(tile, prediction.astype(np.uint8), raster_path, dtype="uint8", nodata=0)
+
+    if export_geojson:
+        geojson_path = tile_output_dir / "pred.geojson"
+        if prediction.any():
+            raster_to_geojson(
+                raster_path,
+                output_path=geojson_path,
+                min_area_ha=postprocess_config.min_area_ha,
+            )
+        else:
+            geojson_path.write_text(json.dumps(empty_feature_collection()))
+            
+    if export_overlay:
+        _create_overlay_png(tile, prediction, tile_output_dir / "overlay.png")
+
+    LOGGER.info("Wrote predictions for %s to %s", tile_id, tile_output_dir)
+    return {"used_threshold": base_threshold, "tile_id": tile_id}
+
+def _create_overlay_png(tile, prediction_mask: np.ndarray, output_path: Path):
+    """Helper for backend to generate a colored PNG overlay for web UI."""
+    from PIL import Image
+    h, w = prediction_mask.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba[prediction_mask.astype(bool)] = [255, 0, 0, 150] # Red, semi-transparent
+    img = Image.fromarray(rgba)
+    img.save(output_path)
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(
