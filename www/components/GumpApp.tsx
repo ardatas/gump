@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback } from 'react'
-import type { Map as LeafletMap, GeoJSON as LeafletGeoJSON, Rectangle as LeafletRectangle } from 'leaflet'
+import type { Map as LeafletMap, GeoJSON as LeafletGeoJSON, Rectangle as LeafletRectangle, ImageOverlay as LeafletImageOverlay } from 'leaflet'
 
 const YEAR_COLORS: Record<number | string, string> = {
   2020: '#fde68a', 2021: '#fbbf24', 2022: '#f97316',
@@ -61,6 +61,15 @@ interface TileSummary {
 }
 
 type ColorMode = 'year' | 'confidence'
+type Composite = 'rgb' | 'falsecolor' | 'swir' | 'redge' | 'ndvi' | 'sar'
+const COMPOSITES: { id: Composite; label: string; desc: string }[] = [
+  { id: 'rgb',        label: 'True Color',   desc: 'B04·B03·B02' },
+  { id: 'falsecolor', label: 'False Color',  desc: 'B08·B04·B03' },
+  { id: 'swir',       label: 'SWIR',         desc: 'B12·B08·B04' },
+  { id: 'redge',      label: 'Red Edge',     desc: 'B06·B05·B04' },
+  { id: 'ndvi',       label: 'NDVI',         desc: '(B08−B04)/(B08+B04)' },
+  { id: 'sar',        label: 'SAR',          desc: 'S1 VV asc.' },
+]
 
 // Ensure API URL points to the backend automatically
 const API_BASE = (typeof window !== 'undefined' && window.location.hostname) 
@@ -121,6 +130,7 @@ export default function GumpApp() {
   const leafletMap = useRef<LeafletMap | null>(null)
   const filesRef = useRef<FileEntry[]>([])
   const tileBoundsLayersRef = useRef<{ tile_id: string; rect: LeafletRectangle }[]>([])
+  const satelliteOverlayRef = useRef<LeafletImageOverlay | null>(null)
   const nextId = useRef(1)
   const colorModeRef = useRef<ColorMode>('year')
 
@@ -145,6 +155,8 @@ export default function GumpApp() {
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null)
   const [availableTiles, setAvailableTiles] = useState<TileSummary[]>([])
   const [activeTileIdx, setActiveTileIdx] = useState<number | null>(null)
+  const [composite, setComposite] = useState<Composite>('rgb')
+  const [satelliteLoading, setSatelliteLoading] = useState(false)
 
   const showToast = useCallback((msg: string) => {
     setToast(msg); clearTimeout(toastTimer.current)
@@ -230,6 +242,8 @@ export default function GumpApp() {
         setFiles([])
         tileBoundsLayersRef.current.forEach(({ rect }) => rect.remove())
         tileBoundsLayersRef.current = []
+        satelliteOverlayRef.current?.remove()
+        satelliteOverlayRef.current = null
         setActiveTileIdx(null)
 
         // Load GeoJSON for each tile
@@ -264,6 +278,29 @@ export default function GumpApp() {
         if (data.tiles.length > 0) setActiveTileIdx(0)
       })
   }, [activeRunId])
+
+  // Satellite preview overlay
+  useEffect(() => {
+    if (activeTileIdx === null || !leafletMap.current) return
+    const tile = availableTiles[activeTileIdx]
+    if (!tile?.bounds) return
+
+    const { min_lat, min_lon, max_lat, max_lon } = tile.bounds
+    const bounds: [[number, number], [number, number]] = [[min_lat, min_lon], [max_lat, max_lon]]
+    const url = `http://${window.location.hostname}:8000/api/tiles/${tile.tile_id}/preview.png?composite=${composite}&month=auto`
+
+    setSatelliteLoading(true)
+    import('leaflet').then(({ default: L }) => {
+      // Remove previous overlay
+      satelliteOverlayRef.current?.remove()
+      const overlay = L.imageOverlay(url, bounds, { opacity: 0.85, zIndex: 200 })
+      overlay.addTo(leafletMap.current!)
+      overlay.on('load', () => setSatelliteLoading(false))
+      overlay.on('error', () => setSatelliteLoading(false))
+      satelliteOverlayRef.current = overlay
+    })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTileIdx, composite])
 
   // basemap switch
   useEffect(() => {
@@ -517,6 +554,28 @@ export default function GumpApp() {
                 </li>
               ))}
             </ul>
+            <div style={{ marginTop: 10 }}>
+              <div className="filter-label-row">
+                <label>Spektrum</label>
+                {satelliteLoading && <span className="muted small">lädt…</span>}
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 4, marginTop: 4 }}>
+                {COMPOSITES.map(c => (
+                  <button
+                    key={c.id}
+                    title={c.desc}
+                    onClick={() => setComposite(c.id)}
+                    style={{
+                      padding: '4px 6px', fontSize: 11, borderRadius: 4, cursor: 'pointer', border: '1px solid',
+                      borderColor: composite === c.id ? '#38bdf8' : 'var(--border, #334155)',
+                      background: composite === c.id ? 'rgba(56,189,248,0.15)' : 'transparent',
+                      color: composite === c.id ? '#38bdf8' : 'var(--text-dim, #94a3b8)',
+                      fontWeight: composite === c.id ? 600 : 400,
+                    }}
+                  >{c.label}</button>
+                ))}
+              </div>
+            </div>
             <p className="muted small" style={{ marginTop: 6 }}>
               {activeTileIdx !== null ? `${activeTileIdx + 1} / ${availableTiles.length}` : `${availableTiles.length} tiles`}
             </p>
