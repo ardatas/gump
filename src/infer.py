@@ -16,11 +16,7 @@ from .dataset import (
     gather_prediction_sequences,
     scatter_predictions,
 )
-from .feature_bank import (
-    build_monthly_sequence,
-    build_tile_features,
-    compute_year_heuristic_map,
-)
+from .feature_bank import build_monthly_sequence, build_tile_features, compute_year_heuristic_map
 from .models import load_model_from_checkpoint
 from .postprocess import PostprocessConfig, postprocess_probability_map
 from .train import (
@@ -63,17 +59,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp-dtype", choices=["none", "bf16", "fp16"], default="bf16")
     parser.add_argument("--threshold-override", type=float)
     parser.add_argument("--threshold-offset", type=float, default=0.0,
-                        help="Added to the checkpoint threshold (negative values lower it, catching more positives).")
+                        help="Additive offset applied to the base threshold (negative = more recall, positive = more precision).")
     parser.add_argument("--per-region-thresholds", type=Path, help="Optional JSON mapping region -> threshold.")
     parser.add_argument("--save-probabilities", action="store_true")
     parser.add_argument("--closing-radius", type=int, default=2)
     parser.add_argument("--opening-radius", type=int, default=1)
     parser.add_argument("--min-area-ha", type=float, default=0.5)
-    parser.add_argument("--min-hole-area-ha", type=float, default=0.5)
+    parser.add_argument("--min-hole-area-ha", type=float, default=0.0)
     parser.add_argument("--persistence-threshold", type=float, default=0.0)
     parser.add_argument("--predict-time-step", action="store_true",
-                        help="Fill the time_step GeoJSON field. Uses the alert_year head if present in any checkpoint; "
-                             "otherwise falls back to a per-pixel NDVI/NBR drop heuristic.")
+                        help="Fill time_step GeoJSON field. Uses the alert_year head if present, otherwise falls back to a per-pixel NDVI/NBR heuristic.")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -122,14 +117,9 @@ def main() -> None:
         probability_dir.mkdir(parents=True, exist_ok=True)
 
     year_bundle = next((bundle for bundle in bundles if bundle.num_year_classes > 0), None)
-    # Auto-enable time_step prediction: use the year head when available, fall
-    # back to the NDVI/NBR heuristic otherwise.  Only suppress if explicitly
-    # opted out via --no-predict-time-step (not currently exposed) or if there
-    # is only a single target year (cannot compute year-over-year drop).
+    # Auto-enable time_step: use year head when available, else NDVI/NBR heuristic when ≥2 target years.
     predict_time_step = args.predict_time_step or year_bundle is not None or len(target_years) >= 2
     heuristic_year_fallback = predict_time_step and year_bundle is None and len(target_years) >= 2
-    if predict_time_step and year_bundle is None and not heuristic_year_fallback:
-        LOGGER.warning("Time-step prediction requested but no year head present and <2 target years; time_step will be empty.")
 
     for tile_path in list_tile_paths(args.cache_root, args.split):
         tile = load_tile_data(tile_path)
@@ -144,30 +134,13 @@ def main() -> None:
 
         ensemble_probabilities = np.zeros(feature_matrix.shape[0], dtype=np.float32)
         for bundle in bundles:
-            # Sub-select only the features this model expects, in the correct order
-            bundle_feature_matrix = feature_matrix
-            if bundle.feature_names and hasattr(tile_features, "feature_names") and tile_features.feature_names:
-                feature_indices = []
-                missing_features = []
-                for expected_name in bundle.feature_names:
-                    try:
-                        idx = tile_features.feature_names.index(expected_name)
-                        feature_indices.append(idx)
-                    except ValueError:
-                        missing_features.append(expected_name)
-                
-                if missing_features:
-                    LOGGER.error("Model expects features not present in tile: %s", missing_features[:5])
-                    continue
-                bundle_feature_matrix = feature_matrix[:, feature_indices]
-            elif feature_matrix.shape[1] != bundle.normalizer.mean.shape[0]:
-                LOGGER.error(
-                    "Model normalizer expects %d features, but generated matrix has %d and no feature_names mapping was found.", 
-                    bundle.normalizer.mean.shape[0], feature_matrix.shape[1]
-                )
-                continue
-
-            normalized = normalize_features(bundle_feature_matrix, bundle.normalizer)
+            bundle_features = _select_checkpoint_features(
+                feature_matrix,
+                current_feature_names=tile_features.feature_names,
+                checkpoint_feature_names=bundle.feature_names,
+                checkpoint_path=bundle.path,
+            )
+            normalized = normalize_features(bundle_features, bundle.normalizer)
             bundle_sequence = sequence_matrix if bundle.sequence_channels > 0 else None
             tile_probabilities = predict_probabilities(
                 model=bundle.model,
@@ -207,7 +180,13 @@ def main() -> None:
 
         time_step_map = None
         if predict_time_step and year_bundle is not None and feature_matrix.shape[0] > 0:
-            normalized_year = normalize_features(feature_matrix, year_bundle.normalizer)
+            year_features = _select_checkpoint_features(
+                feature_matrix,
+                current_feature_names=tile_features.feature_names,
+                checkpoint_feature_names=year_bundle.feature_names,
+                checkpoint_path=year_bundle.path,
+            )
+            normalized_year = normalize_features(year_features, year_bundle.normalizer)
             year_logits = predict_year_logits(
                 model=year_bundle.model,
                 features=normalized_year,
@@ -306,6 +285,35 @@ def _load_per_region_thresholds(path: Path | None) -> dict[str, float]:
         return {}
     raw = json.loads(path.read_text())
     return {str(region): float(value) for region, value in raw.items()}
+
+
+def _select_checkpoint_features(
+    feature_matrix: np.ndarray,
+    *,
+    current_feature_names: tuple[str, ...],
+    checkpoint_feature_names: tuple[str, ...],
+    checkpoint_path: Path,
+) -> np.ndarray:
+    if not checkpoint_feature_names:
+        return feature_matrix
+    if checkpoint_feature_names == current_feature_names:
+        return feature_matrix
+
+    index_by_name = {name: index for index, name in enumerate(current_feature_names)}
+    missing = [name for name in checkpoint_feature_names if name not in index_by_name]
+    if missing:
+        missing_preview = ", ".join(missing[:8])
+        if len(missing) > 8:
+            missing_preview += ", ..."
+        raise SystemExit(
+            f"Checkpoint {checkpoint_path} expects missing features: {missing_preview}"
+        )
+
+    indices = np.asarray(
+        [index_by_name[name] for name in checkpoint_feature_names],
+        dtype=np.int64,
+    )
+    return feature_matrix[:, indices]
 
 
 def _attach_time_step_to_geojson(

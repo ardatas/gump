@@ -16,13 +16,14 @@ from .cache import TileData
 LOGGER = logging.getLogger(__name__)
 
 S2_SCALE = 10_000.0
+S2_BLUE_INDEX = 1
 S2_RED_INDEX = 3
 S2_NIR_INDEX = 7
 S2_SWIR1_INDEX = 10
 S2_SWIR2_INDEX = 11
 
 _CACHE_COMPRESSOR = numcodecs.Blosc(cname="zstd", clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
-_FEATURE_CACHE_VERSION = 2  # bump when feature computation changes
+_FEATURE_CACHE_VERSION = 3  # bump when feature computation changes
 
 # AEF embeddings are stored quantized (uint8-range float32).
 # Formula from the AlphaEarth workshop notebook:
@@ -97,6 +98,7 @@ def build_monthly_sequence(
         )
 
     s2_scaled = tile.s2_data / S2_SCALE
+    s2_cloud_mask = _cloud_shadow_mask(s2_scaled)  # (n_obs, H, W) True = bad
     s2_index_map = _index_by_year_month(tile.s2_year, tile.s2_month)
     s1_asc_index_map = _index_by_year_month(tile.s1_ascending_year, tile.s1_ascending_month)
     s1_desc_index_map = _index_by_year_month(tile.s1_descending_year, tile.s1_descending_month)
@@ -125,6 +127,7 @@ def build_monthly_sequence(
                 np.isfinite(band_red)
                 & np.isfinite(band_nir)
                 & ((band_red + band_nir + band_swir1 + band_swir2) > 0)
+                & ~s2_cloud_mask[s2_obs_index]
             )
             sequence_mask[time_idx] |= valid_pixel
 
@@ -156,6 +159,31 @@ def _index_by_year_month(years: np.ndarray, months: np.ndarray) -> dict[tuple[in
         if key not in mapping:
             mapping[key] = index
     return mapping
+
+
+def _cloud_shadow_mask(s2_scaled: np.ndarray) -> np.ndarray:
+    """Detect cloud and shadow pixels in Sentinel-2 reflectance data.
+
+    Returns a boolean mask (n_obs, H, W) where True = cloud or shadow.
+    Thresholds are chosen to be conservative: prefer false negatives over
+    masking real vegetation signal.
+
+    Cloud: high blue, visible NIR and SWIR (all optically bright)
+    Shadow: very dark NIR and blue (sub-canopy or cloud shadow)
+    Saturated: any band >1.0 (sensor saturation artifact)
+    """
+    if s2_scaled.shape[0] == 0:
+        return np.zeros(s2_scaled.shape[:1] + s2_scaled.shape[2:], dtype=bool)
+
+    blue = s2_scaled[:, S2_BLUE_INDEX]   # B02
+    nir = s2_scaled[:, S2_NIR_INDEX]     # B08
+    swir1 = s2_scaled[:, S2_SWIR1_INDEX] # B11
+
+    cloud = (blue > 0.20) & (nir > 0.10) & (swir1 > 0.10)
+    shadow = (nir < 0.06) & (blue < 0.06)
+    saturated = (s2_scaled > 1.2).any(axis=1)
+
+    return cloud | shadow | saturated
 
 
 def _dequantize_aef(data: np.ndarray) -> np.ndarray:
@@ -208,6 +236,9 @@ def build_tile_features(
 
     # --- S2 ---
     s2 = tile.s2_data / S2_SCALE
+    _cloud_mask = _cloud_shadow_mask(s2)  # (n_obs, H, W)
+    if _cloud_mask.any():
+        s2 = np.where(_cloud_mask[:, None, :, :], np.nan, s2)
     s2_yearly = _yearly_reduce(s2, tile.s2_year, target_years, reducer="median")
     s2_std = _safe_nanstd(s2, axis=0)
     s2_delta = s2_yearly[-1] - s2_yearly[0]

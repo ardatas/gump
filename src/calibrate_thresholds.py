@@ -21,7 +21,7 @@ from .dataset import (
     gather_eval_sequences,
 )
 from .feature_bank import build_monthly_sequence, build_tile_features
-from .infer import load_checkpoint_bundle
+from .infer import load_checkpoint_bundle, _select_checkpoint_features
 from .metrics import find_best_threshold, find_best_threshold_per_region, weighted_average_precision
 from .train import RuntimeConfig, normalize_features, predict_probabilities, resolve_amp_dtype
 
@@ -100,7 +100,13 @@ def main() -> None:
 
         ensemble_probabilities = np.zeros(feature_matrix.shape[0], dtype=np.float32)
         for bundle in bundles:
-            normalized = normalize_features(feature_matrix, bundle.normalizer)
+            bundle_features = _select_checkpoint_features(
+                feature_matrix,
+                current_feature_names=tile_features.feature_names,
+                checkpoint_feature_names=bundle.feature_names,
+                checkpoint_path=bundle.path,
+            )
+            normalized = normalize_features(bundle_features, bundle.normalizer)
             bundle_sequence = sequence_matrix if bundle.sequence_channels > 0 else None
             ensemble_probabilities += predict_probabilities(
                 model=bundle.model,
